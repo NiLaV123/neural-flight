@@ -5,6 +5,23 @@ A neural network that learns to fly a bird-like creature through rings. The bird
 - `bird_env.py`: batched PyTorch simulator, runs entirely on the GPU (Apple MPS or CUDA)
 - `train.py`: PPO training
 - `replay.py`: flies a trained policy and writes an interactive 3D replay page
+- `hub.py`: a local dashboard that runs all of the above for you
+
+## Quick start: the Hub
+
+```bash
+./start.sh
+```
+
+The first time, this creates `.venv` and installs the requirements. It then opens the **Neural Flight Hub** at http://127.0.0.1:8765, where you can:
+
+- **Train**: pick a preset (quick test, standard or long), or set the iterations, parallel birds, device and snapshots yourself. You can start from scratch or continue from any checkpoint.
+- **Watch progress**: see live charts of rings per episode, return, ring radius and episode length, plus the current steps per second, for any run.
+- **Follow activity**: open the output of each running job, or stop a training run.
+- **Browse checkpoints**: every run in `checkpoints/` and `runs/<name>/`, each with Replay and Continue training buttons.
+- **Make replays**: fly a checkpoint and watch the recorded 3D replay right in the page. Replays are saved in `replays/`.
+
+The hub uses only the Python standard library and runs the same `train.py` and `replay.py` commands shown below, so the command line still works the same way. You can use `--port` to change the port or `--no-browser` to stop it opening a browser.
 
 ## How the simulation works
 

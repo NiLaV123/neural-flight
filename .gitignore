@@ -5,3 +5,5 @@ __pycache__/
 # regenerable recorded replays (python replay.py / runs/fresh/make_replays.sh)
 replay.html
 runs/*/replay_iter_*.html
+# replays made from the hub
+replays/

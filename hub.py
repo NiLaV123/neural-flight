@@ -1,0 +1,325 @@
+"""
+Neural Flight Hub: one place to train, watch progress, and make replays.
+
+    python hub.py            # opens http://127.0.0.1:8765 in your browser
+    python hub.py --port 9000 --no-browser
+
+Uses only the Python standard library. Training and replays run as the same
+`train.py` / `replay.py` you would run by hand, so everything still works from
+the command line too.
+"""
+import argparse
+import json
+import os
+import re
+
+import signal
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+ROOT = Path(__file__).resolve().parent
+RUNS_DIR = ROOT / "runs"
+REPLAY_DIR = ROOT / "replays"
+PY = sys.executable
+
+LOG_RE = re.compile(
+    r"it\s+(\d+)\s*\|\s*sps\s+([\d.]+)\s*\|\s*ep_ret\s+(-?[\d.]+)\s*\|\s*ep_len\s+([\d.]+)\s*\|\s*"
+    r"rings/ep\s+([\d.]+)\s*\|\s*max\s+([\d.]+)\s*\|\s*ring_r\s+([\d.]+)\s*\|\s*std\s+([\d.]+)\s*\|\s*lr\s+([\d.e+-]+)"
+)
+NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+# --------------------------------------------------------------------- runs & files
+def run_dirs():
+    """Every folder that holds checkpoints: `checkpoints/` plus each `runs/<name>/`."""
+    out = []
+    if (ROOT / "checkpoints").is_dir():
+        out.append(("checkpoints", ROOT / "checkpoints"))
+    if RUNS_DIR.is_dir():
+        for d in sorted(RUNS_DIR.iterdir()):
+            if d.is_dir():
+                out.append((f"runs/{d.name}", d))
+    return out
+
+
+def log_path(run_dir):
+    p = run_dir / "train.log"
+    if not p.exists() and run_dir == ROOT / "checkpoints" and (ROOT / "train.log").exists():
+        return ROOT / "train.log"  # the original run logged next to train.py
+    return p
+
+
+def parse_log(path):
+    pts = []
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return pts
+    for line in text.splitlines():
+        m = LOG_RE.search(line)
+        if m:
+            it, sps, ret, ln, rings, mx, rr, std, lr = m.groups()
+            pts.append(dict(it=int(it), sps=float(sps), ret=float(ret), len=float(ln), rings=float(rings),
+                            max=float(mx), ring_r=float(rr), std=float(std), lr=float(lr)))
+    return pts
+
+
+def ckpt_sort_key(p):
+    m = re.match(r"iter_(\d+)$", p.stem)
+    return (0, int(m.group(1))) if m else (1, p.stem)
+
+
+def list_runs():
+    runs = []
+    for name, d in run_dirs():
+        cks = sorted(d.glob("*.pt"), key=ckpt_sort_key)
+        pts = parse_log(log_path(d))
+        runs.append(dict(
+            name=name,
+            checkpoints=[dict(path=str(c.relative_to(ROOT)), name=c.name, size=c.stat().st_size,
+                              mtime=c.stat().st_mtime) for c in cks],
+            last=pts[-1] if pts else None,
+            best_rings=max((p["rings"] for p in pts), default=None),
+            mtime=max([c.stat().st_mtime for c in cks] + [0]),
+        ))
+    return runs
+
+
+def list_replays():
+    if not REPLAY_DIR.is_dir():
+        return []
+    files = sorted(REPLAY_DIR.glob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [dict(name=f.name, mtime=f.stat().st_mtime, size=f.stat().st_size) for f in files]
+
+
+def safe_ckpt(rel):
+    p = (ROOT / rel).resolve()
+    if p.suffix != ".pt" or not p.is_file() or ROOT not in p.parents:
+        raise ValueError(f"not a checkpoint in this project: {rel}")
+    return p
+
+
+# --------------------------------------------------------------------- jobs
+class Job:
+    _next = 1
+
+    def __init__(self, kind, title, cmd, log_file=None, meta=None):
+        self.id = Job._next; Job._next += 1
+        self.kind, self.title, self.cmd, self.meta = kind, title, cmd, meta or {}
+        self.lines = deque(maxlen=400)
+        self.status, self.code = "running", None
+        self.started, self.ended = time.time(), None
+        self.log_file = log_file
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, bufsize=1, env=env, start_new_session=True)
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        fh = open(self.log_file, "a") if self.log_file else None
+        try:
+            for line in self.proc.stdout:
+                self.lines.append(line.rstrip("\n"))
+                if fh:
+                    fh.write(line); fh.flush()
+        finally:
+            self.code = self.proc.wait()
+            if self.status == "running":
+                self.status = "done" if self.code == 0 else "failed"
+            self.ended = time.time()
+            if fh:
+                fh.close()
+
+    def stop(self):
+        if self.proc.poll() is None:
+            self.status = "stopped"
+            try:
+                os.killpg(self.proc.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            threading.Timer(8, self._kill).start()
+
+    def _kill(self):
+        if self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def info(self, full=False):
+        d = dict(id=self.id, kind=self.kind, title=self.title, status=self.status, code=self.code,
+                 started=self.started, ended=self.ended, meta=self.meta, cmd=" ".join(self.cmd[1:]),
+                 tail=list(self.lines)[-(400 if full else 6):])
+        return d
+
+
+JOBS = []
+LOCK = threading.Lock()
+ENV_INFO = dict(status="checking")
+
+
+def check_env():
+    code = ("import json,torch;d='cuda' if torch.cuda.is_available() else "
+            "('mps' if torch.backends.mps.is_available() else 'cpu');"
+            "print(json.dumps(dict(torch=torch.__version__,device=d)))")
+    try:
+        r = subprocess.run([PY, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=120)
+        if r.returncode == 0:
+            ENV_INFO.update(json.loads(r.stdout.strip().splitlines()[-1]), status="ok")
+        else:
+            ENV_INFO.update(status="missing", error="PyTorch is not installed for " + PY)
+    except Exception as e:  # noqa: BLE001
+        ENV_INFO.update(status="missing", error=str(e))
+    ENV_INFO["python"] = PY
+
+
+def start_training(body):
+    with LOCK:
+        if any(j.kind == "train" and j.status == "running" for j in JOBS):
+            raise ValueError("a training run is already going; stop it first")
+    name = body.get("run", "").strip() or time.strftime("run_%Y%m%d_%H%M%S")
+    if not NAME_RE.match(name):
+        raise ValueError("run name may only use letters, numbers, '-', '_' and '.'")
+    out = RUNS_DIR / name
+    out.mkdir(parents=True, exist_ok=True)
+    cmd = [PY, "train.py", "--out", str(out.relative_to(ROOT))]
+    for key, flag, typ in [("envs", "--envs", int), ("iters", "--iters", int), ("steps", "--steps", int),
+                           ("lr", "--lr", float)]:
+        if str(body.get(key, "")).strip():
+            cmd += [flag, str(typ(body[key]))]
+    dev = body.get("device", "auto")
+    if dev not in ("auto", "mps", "cuda", "cpu"):
+        raise ValueError("bad device")
+    cmd += ["--device", dev]
+    snaps = str(body.get("snapshots", "")).strip()
+    if snaps:
+        if not re.fullmatch(r"\d+(\s*,\s*\d+)*", snaps):
+            raise ValueError("snapshots should look like 0,10,50,100")
+        cmd += ["--snapshots", snaps.replace(" ", "")]
+    if body.get("resume"):
+        cmd += ["--resume", str(safe_ckpt(body["resume"]).relative_to(ROOT))]
+    if body.get("no_compile"):
+        cmd += ["--no-compile"]
+    job = Job("train", f"Training runs/{name}", cmd, log_file=out / "train.log", meta=dict(run=f"runs/{name}"))
+    with LOCK:
+        JOBS.append(job)
+    return job
+
+
+def start_replay(body):
+    ck = safe_ckpt(body.get("ckpt", ""))
+    birds = max(1, min(64, int(body.get("birds", 4))))
+    seconds = max(1.0, min(600.0, float(body.get("seconds", 60))))
+    seed = int(body.get("seed", 1))
+    REPLAY_DIR.mkdir(exist_ok=True)
+    rel = ck.relative_to(ROOT)
+    stem = "_".join(rel.with_suffix("").parts[-2:])
+    out = REPLAY_DIR / f"{stem}_b{birds}_s{seed}.html"
+    cmd = [PY, "replay.py", "--ckpt", str(rel), "--birds", str(birds), "--seconds", str(seconds),
+           "--seed", str(seed), "--out", str(out.relative_to(ROOT))]
+    job = Job("replay", f"Replay of {rel}", cmd, meta=dict(out=out.name))
+    with LOCK:
+        JOBS.append(job)
+    return job
+
+
+# --------------------------------------------------------------------- http
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else (json.dumps(body) if ctype == "application/json" else body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + ("; charset=utf-8" if "text" in ctype or "json" in ctype else ""))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        try:
+            if u.path in ("/", "/index.html"):
+                return self._send(200, (ROOT / "hub.html").read_bytes(), "text/html")
+            if u.path == "/api/state":
+                with LOCK:
+                    jobs = [j.info() for j in reversed(JOBS)]
+                return self._send(200, dict(env=ENV_INFO, jobs=jobs, runs=list_runs(), replays=list_replays()))
+            if u.path == "/api/metrics":
+                name = q.get("run", [""])[0]
+                d = dict(run_dirs()).get(name)
+                if d is None:
+                    return self._send(404, dict(error="unknown run"))
+                return self._send(200, dict(run=name, points=parse_log(log_path(d))))
+            if u.path == "/api/job":
+                jid = int(q.get("id", ["0"])[0])
+                job = next((j for j in JOBS if j.id == jid), None)
+                return self._send(200, job.info(full=True)) if job else self._send(404, dict(error="no such job"))
+            if u.path.startswith("/replays/"):
+                name = unquote(u.path[len("/replays/"):])
+                f = (REPLAY_DIR / name).resolve()
+                if f.parent == REPLAY_DIR.resolve() and f.suffix == ".html" and f.is_file():
+                    return self._send(200, f.read_bytes(), "text/html")
+            return self._send(404, dict(error="not found"))
+        except Exception as e:  # noqa: BLE001
+            return self._send(500, dict(error=str(e)))
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if u.path == "/api/train":
+                return self._send(200, start_training(body).info())
+            if u.path == "/api/replay":
+                return self._send(200, start_replay(body).info())
+            if u.path == "/api/stop":
+                job = next((j for j in JOBS if j.id == int(body.get("id", 0))), None)
+                if job:
+                    job.stop()
+                return self._send(200, dict(ok=True))
+            if u.path == "/api/delete_replay":
+                f = (REPLAY_DIR / body.get("name", "")).resolve()
+                if f.parent == REPLAY_DIR.resolve() and f.suffix == ".html" and f.is_file():
+                    f.unlink()
+                return self._send(200, dict(ok=True))
+            return self._send(404, dict(error="not found"))
+        except ValueError as e:
+            return self._send(400, dict(error=str(e)))
+        except Exception as e:  # noqa: BLE001
+            return self._send(500, dict(error=str(e)))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--no-browser", action="store_true")
+    args = p.parse_args()
+
+    threading.Thread(target=check_env, daemon=True).start()
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    url = f"http://127.0.0.1:{args.port}"
+    print(f"Neural Flight Hub running at {url}  (Ctrl+C to quit)")
+    if not args.no_browser:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for j in JOBS:
+            j.stop()
+        srv.server_close()
+
+
+if __name__ == "__main__":
+    main()
