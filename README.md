@@ -2,20 +2,9 @@
 
 A neural network that learns to fly a bird-like creature through rings. The bird is controlled one surface at a time (each wing's flap, sweep and twist, plus the tail's pitch, tilt and spread), and its flight is physically simulated: rigid-body momentum and rotation, with lift and drag on every wing segment. There is no scripted thrust; the bird has to discover flapping to stay up.
 
-The project has two parts:
-
-| | What it is | Use it for |
-|---|---|---|
-| **Training** (`bird_env.py`, `train.py`) | Batched PyTorch simulator + PPO, runs entirely on the GPU (Apple MPS or CUDA) | Teaching the network to fly |
-| **Live web demo** (`web/`, `docs/index.html`) | The same simulator and network ported to Rust → WebAssembly, rendered with WebGPU | Watching and playing with the trained birds |
-
-## Live demo
-
-Open `docs/index.html` in a browser with WebGPU (current Chrome or Edge, or Safari 26+). It is a single self-contained file. The trained network flies live in your browser; this is not a recording. From the page you can:
-
-- scrub through **training stages** (iteration 0 → 300) to watch random flailing turn into flight
-- change **wind and turbulence** (the bird never saw wind during training), **action noise**, **ring size**, **flock size** (1–64) and **time scale**
-- switch between **chase, orbit and bird's-eye** cameras
+- `bird_env.py`: batched PyTorch simulator, runs entirely on the GPU (Apple MPS or CUDA)
+- `train.py`: PPO training
+- `replay.py`: flies a trained policy and writes an interactive 3D replay page
 
 ## How the simulation works
 
@@ -42,28 +31,13 @@ The training setup:
 
 On macOS, use `caffeinate -i` so the machine doesn't sleep mid-run.
 
-## Results
-
-The models below were evaluated in the wasm simulator, with 32 birds × 60 s × 3 seeds each:
-
-| Model | Rings per bird per minute | Crashes (96 bird-minutes) |
-|---|---|---|
-| `runs/fresh/iter_300.pt` (**best**) | **63.3** | **0** |
-| `runs/fresh/best.pt` (iter 280) | 61.1 | 0 |
-| `checkpoints/latest.pt` (first run, iter 250) | 57.0 | 4 |
-| `runs/fresh/iter_200.pt` | 49.6 | 13 |
-
-## Rebuilding the web demo
-
-You need Rust with the `wasm32-unknown-unknown` target:
+## Replays
 
 ```bash
-.venv/bin/python web/build.py --run runs/fresh     # compiles wasm, exports snapshots, writes docs/index.html
+.venv/bin/python replay.py --ckpt runs/fresh/iter_300.pt --birds 4 --seconds 60 --out replay.html
 ```
 
-`web/test/verify.mjs` checks the wasm port against the PyTorch simulator and measures flight performance. Observations match to within 2e-7, and positions match to 4 decimal places for the first second of flight.
-
-Recorded replays from the PyTorch simulator can still be made with `replay.py`, which uses the three.js viewer in `viewer_template.html`.
+This flies the policy in the PyTorch simulator and writes a recorded three.js replay using `viewer_template.html`. `runs/fresh/make_replays.sh` makes one for every snapshot.
 
 ## Known simplifications
 
