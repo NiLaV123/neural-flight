@@ -62,8 +62,8 @@ def main():
                 iter=ck.get("iter", 0), j_lo=env.j_lo.tolist(), j_hi=env.j_hi.tolist(),
                 species=env.species, species_info=SPECIES_INFO[env.species], scale=env.SCALE,
                 colors=list(env.COLORS), tail_area=list(env.TAIL_AREA), wing_momentum=env.wing_dynamics)
-    html = open("viewer_template.html").read().replace("__DATA__", json.dumps(dict(meta=meta, birds=birds)))
-    with open(args.out, "w") as f:
+    html = open("viewer_template.html", encoding="utf-8").read().replace("__DATA__", json.dumps(dict(meta=meta, birds=birds)))
+    with open(args.out, "w", encoding="utf-8") as f:
         f.write(html)
     print("wrote", args.out)
 

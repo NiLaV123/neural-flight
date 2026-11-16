@@ -10,7 +10,8 @@ A neural network that learns to fly a bird-like creature through rings. The bird
 ## Quick start: the Hub
 
 ```bash
-./start.sh
+./start.sh        # macOS / Linux
+start.bat         # Windows (or double-click it)
 ```
 
 The first time, this creates `.venv` and installs the requirements. It then opens the **Neural Flight Hub** at http://127.0.0.1:8765, where you can:
@@ -23,6 +24,14 @@ The first time, this creates `.venv` and installs the requirements. It then open
 - **Make replays**: fly a checkpoint and watch the recorded 3D replay right in the page. Replays are saved in `replays/`.
 
 The hub uses only the Python standard library and runs the same `train.py` and `replay.py` commands shown below, so the command line still works the same way. You can use `--port` to change the port or `--no-browser` to stop it opening a browser.
+
+### Windows and NVIDIA GPUs
+
+Training runs on NVIDIA GPUs through CUDA, on Windows and Linux.
+
+- **Windows:** `start.bat` needs Python 3 from python.org with "Add python.exe to PATH" ticked. On first run, `setup_env.py` reads your NVIDIA driver's CUDA version and installs the matching CUDA build of PyTorch. A plain `pip install torch` would install the CPU-only build on Windows. The hub's top bar should then show **CUDA**. If it shows CPU, update your NVIDIA driver, delete `.venv` and run `start.bat` again.
+- **`torch.compile`:** on Windows it often isn't available because it needs Triton. When that happens, training says so once and carries on without it. The results are the same, but training is slower.
+- **Linux:** the default `pip install torch` already includes CUDA, so `./start.sh` works as is.
 
 ## Bird species
 

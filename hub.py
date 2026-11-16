@@ -26,6 +26,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
+WINDOWS = os.name == "nt"
 RUNS_DIR = ROOT / "runs"
 REPLAY_DIR = ROOT / "replays"
 PY = sys.executable
@@ -41,7 +42,7 @@ NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 # --------------------------------------------------------------------- runs & files
 def load_species():
     """Read SPECIES_INFO from bird_env.py without importing torch (keeps the hub instant)."""
-    tree = ast.parse((ROOT / "bird_env.py").read_text())
+    tree = ast.parse((ROOT / "bird_env.py").read_text(encoding="utf-8"))
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "SPECIES_INFO" for t in node.targets):
             return ast.literal_eval(node.value)
@@ -54,7 +55,7 @@ SPECIES = load_species()
 def run_config(d):
     """Which bird a run trains. Runs from before species existed are the massless-wing hawk."""
     try:
-        cfg = json.loads((d / "config.json").read_text())
+        cfg = json.loads((d / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         cfg = {}
     return dict(species=cfg.get("species", "hawk"), wing_dynamics=cfg.get("wing_dynamics", False),
@@ -83,7 +84,7 @@ def log_path(run_dir):
 def parse_log(path):
     pts = []
     try:
-        text = path.read_text(errors="replace")
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return pts
     for line in text.splitlines():
@@ -142,13 +143,15 @@ class Job:
         self.status, self.code = "running", None
         self.started, self.ended = time.time(), None
         self.log_file = log_file
-        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+        group = (dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if WINDOWS
+                 else dict(start_new_session=True))
         self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, bufsize=1, env=env, start_new_session=True)
+                                     text=True, encoding="utf-8", errors="replace", bufsize=1, env=env, **group)
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _pump(self):
-        fh = open(self.log_file, "a") if self.log_file else None
+        fh = open(self.log_file, "a", encoding="utf-8") if self.log_file else None
         try:
             for line in self.proc.stdout:
                 self.lines.append(line.rstrip("\n"))
@@ -166,16 +169,22 @@ class Job:
         if self.proc.poll() is None:
             self.status = "stopped"
             try:
-                os.killpg(self.proc.pid, signal.SIGINT)
-            except ProcessLookupError:
+                if WINDOWS:
+                    self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    os.killpg(self.proc.pid, signal.SIGINT)
+            except (ProcessLookupError, OSError):
                 pass
             threading.Timer(8, self._kill).start()
 
     def _kill(self):
         if self.proc.poll() is None:
             try:
-                os.killpg(self.proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
+                if WINDOWS:
+                    self.proc.kill()
+                else:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
                 pass
 
     def info(self, full=False):

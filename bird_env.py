@@ -223,8 +223,23 @@ class BirdEnv:
         self.since_ring = torch.zeros_like(self.steps)
         self.rings = torch.zeros_like(self.steps)
         impl = self._substep_dyn if wing_dynamics else self._substep_impl
-        self._substep = torch.compile(impl, dynamic=False) if compile else impl
+        self._substep = self._compiled(impl) if compile else impl
         self.reset(torch.ones(num_envs, dtype=torch.bool, device=device))
+
+    def _compiled(self, impl):
+        """torch.compile the physics, falling back to plain PyTorch where the compiler
+        isn't available (e.g. Windows without Triton). The fallback is slower but identical."""
+        fast = torch.compile(impl, dynamic=False)
+
+        def run(*args):
+            try:
+                return fast(*args)
+            except Exception as e:  # noqa: BLE001
+                msg = str(e).strip().splitlines()[0][:160] if str(e).strip() else type(e).__name__
+                print(f"torch.compile is not available here ({msg}); continuing without it (slower).", flush=True)
+                self._substep = impl
+                return impl(*args)
+        return run
 
     # ------------------------------------------------------------------ geometry
     def surfaces(self, joints, axes=False):

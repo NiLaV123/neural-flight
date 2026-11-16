@@ -130,7 +130,7 @@ def main():
         env.ring_radius = ck.get("ring_radius", env.ring_radius)
         start_it = ck.get("iter", 0)
     os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, "config.json"), "w") as fh:
+    with open(os.path.join(args.out, "config.json"), "w", encoding="utf-8") as fh:
         json.dump(dict(cfg, envs=args.envs), fh, indent=2)
 
     def checkpoint(it):
