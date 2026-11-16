@@ -27,15 +27,20 @@ def nvidia():
                            capture_output=True, text=True, timeout=30).stdout.strip().splitlines()
     except (OSError, subprocess.SubprocessError):
         return None
-    m = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", out)
-    if not m:
+    # older drivers print "CUDA Version: 12.8", newer ones "CUDA UMD Version: 13.5"
+    m = re.search(r"CUDA\s+(?:UMD\s+)?Version:\s*(\d+)\.(\d+)", out)
+    if m:
+        driver = (int(m.group(1)), int(m.group(2)))
+    elif q:
+        driver = (99, 0)        # GPU present but the format is new to us: try the newest builds first
+    else:
         return None
     name, cap = (q[0].rsplit(",", 1) + ["0"])[:2] if q else ("NVIDIA GPU", "0")
     try:
         cap = tuple(int(x) for x in cap.strip().split("."))
     except ValueError:
         cap = (0, 0)
-    return (int(m.group(1)), int(m.group(2))), name.strip(), cap
+    return driver, name.strip(), cap
 
 
 def pick_builds(driver, cap):
@@ -58,6 +63,17 @@ def gpu_works():
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     msg = (r.stdout.strip().splitlines() or [r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "torch missing"])[-1]
     return r.returncode == 0, msg
+
+
+def ensure_triton():
+    """torch.compile needs Triton, which Windows PyTorch doesn't ship; the triton-windows package
+    provides it and roughly halves the time of a physics step. Optional: training runs without it."""
+    r = subprocess.run([sys.executable, "-c", "import triton"], capture_output=True)
+    if r.returncode == 0:
+        return
+    print("Installing triton-windows so torch.compile can speed up the physics...")
+    if subprocess.call([sys.executable, "-m", "pip", "install", "triton-windows"]) != 0:
+        print("Could not install triton-windows; training will run without torch.compile (slower).")
 
 
 def install(gpu):
@@ -99,12 +115,16 @@ def main():
         ok, msg = gpu_works()
         if ok:
             print(f"GPU ready: {gpu[1]} ({msg})")
+            if sys.platform == "win32":
+                ensure_triton()
             return
         print(f"{gpu[1]} found but PyTorch can't use it ({msg}). Reinstalling PyTorch with GPU support...")
     install(gpu)
     if gpu:
         ok, msg = gpu_works()
         print(("GPU ready: " if ok else "Warning, GPU still not usable: ") + f"{gpu[1]} ({msg})")
+        if ok and sys.platform == "win32":
+            ensure_triton()
     print("Done.")
 
 
