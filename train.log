@@ -1,0 +1,26 @@
+device: mps
+it    10 | sps   112813 | ep_ret  -23.71 | ep_len    256 | rings/ep  0.00 | max   1 | ring_r 4.00 | std 0.593 | lr 1.0e-03
+it    20 | sps   113667 | ep_ret  -20.59 | ep_len    349 | rings/ep  0.00 | max   1 | ring_r 4.00 | std 0.569 | lr 1.0e-03
+it    30 | sps   112137 | ep_ret  -22.74 | ep_len    466 | rings/ep  0.00 | max   1 | ring_r 4.00 | std 0.535 | lr 6.7e-04
+it    40 | sps   114373 | ep_ret  -14.65 | ep_len    587 | rings/ep  0.02 | max   1 | ring_r 4.00 | std 0.510 | lr 1.0e-03
+it    50 | sps   115043 | ep_ret   -3.58 | ep_len    627 | rings/ep  0.23 | max   3 | ring_r 4.00 | std 0.482 | lr 1.3e-04
+it    60 | sps   117159 | ep_ret    0.04 | ep_len    636 | rings/ep  0.27 | max   4 | ring_r 4.00 | std 0.459 | lr 1.0e-03
+it    70 | sps   111183 | ep_ret   22.77 | ep_len    725 | rings/ep  0.92 | max   5 | ring_r 4.00 | std 0.441 | lr 1.0e-03
+it    80 | sps   113441 | ep_ret   15.30 | ep_len    688 | rings/ep  0.68 | max   6 | ring_r 4.00 | std 0.425 | lr 1.0e-03
+it    90 | sps   116013 | ep_ret   40.57 | ep_len    775 | rings/ep  1.39 | max   9 | ring_r 4.00 | std 0.409 | lr 3.0e-04
+it   100 | sps   113789 | ep_ret   67.45 | ep_len    859 | rings/ep  2.13 | max   9 | ring_r 4.00 | std 0.397 | lr 1.7e-04
+it   110 | sps   111674 | ep_ret   88.08 | ep_len    913 | rings/ep  2.72 | max  17 | ring_r 4.00 | std 0.385 | lr 4.4e-04
+it   120 | sps   111697 | ep_ret  233.87 | ep_len   1196 | rings/ep  6.64 | max  22 | ring_r 4.00 | std 0.374 | lr 3.0e-04
+it   130 | sps   108224 | ep_ret  523.00 | ep_len   1661 | rings/ep 14.18 | max  24 | ring_r 3.80 | std 0.364 | lr 2.6e-04
+it   140 | sps   105897 | ep_ret  655.23 | ep_len   1785 | rings/ep 17.69 | max  27 | ring_r 3.61 | std 0.355 | lr 1.1e-04
+it   150 | sps   107495 | ep_ret  768.59 | ep_len   1874 | rings/ep 20.62 | max  29 | ring_r 3.43 | std 0.346 | lr 2.6e-04
+it   160 | sps   110789 | ep_ret  793.79 | ep_len   1835 | rings/ep 21.25 | max  29 | ring_r 3.26 | std 0.336 | lr 1.7e-05
+it   170 | sps   111020 | ep_ret  796.67 | ep_len   1784 | rings/ep 21.29 | max  30 | ring_r 3.10 | std 0.328 | lr 1.7e-04
+it   180 | sps   110604 | ep_ret  806.61 | ep_len   1743 | rings/ep 21.48 | max  31 | ring_r 2.94 | std 0.319 | lr 1.1e-04
+it   190 | sps   113455 | ep_ret  912.91 | ep_len   1839 | rings/ep 24.23 | max  32 | ring_r 2.79 | std 0.310 | lr 1.0e-03
+it   200 | sps   112552 | ep_ret  942.03 | ep_len   1845 | rings/ep 25.10 | max  34 | ring_r 2.65 | std 0.302 | lr 3.0e-04
+it   210 | sps   113270 | ep_ret 1015.30 | ep_len   1889 | rings/ep 26.92 | max  36 | ring_r 2.52 | std 0.297 | lr 1.1e-04
+it   220 | sps   113817 | ep_ret 1017.00 | ep_len   1856 | rings/ep 26.99 | max  35 | ring_r 2.39 | std 0.290 | lr 5.9e-05
+it   230 | sps   113456 | ep_ret  978.37 | ep_len   1767 | rings/ep 25.94 | max  36 | ring_r 2.28 | std 0.286 | lr 1.7e-04
+it   240 | sps   105711 | ep_ret  965.84 | ep_len   1736 | rings/ep 25.60 | max  37 | ring_r 2.16 | std 0.281 | lr 8.6e-04
+it   250 | sps      259 | ep_ret 1045.41 | ep_len   1794 | rings/ep 27.63 | max  38 | ring_r 2.05 | std 0.276 | lr 1.1e-04

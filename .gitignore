@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+web/sim/target/
+web/build/
+# regenerable recorded replays (python replay.py / runs/fresh/make_replays.sh)
+replay.html
+runs/*/replay_iter_*.html
