@@ -5,16 +5,25 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bird Flight Replay</title>
 <style>
-  :root { --bg:#0e1420; --panel:rgba(14,20,32,.82); --text:#e8edf5; --muted:#8c98ab; --accent:#ffb547; --ok:#5fd38d; --line:rgba(255,255,255,.12); }
+  :root { --bg:#0e1420; --panel:rgba(14,20,32,.82); --text:#e8edf5; --muted:#8c98ab; --accent:#ffb547; --ok:#5fd38d; --bad:#ff7b7b; --line:rgba(255,255,255,.12); }
   html,body { margin:0; height:100%; background:var(--bg); color:var(--text); font:13px/1.4 ui-sans-serif,system-ui,-apple-system,sans-serif; overflow:hidden; }
   canvas { display:block; }
-  .hud { position:absolute; top:12px; left:12px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-width:190px; backdrop-filter:blur(6px); }
-  .hud h1 { font-size:13px; margin:0 0 6px; font-weight:600; letter-spacing:.02em; }
+  .hud { position:absolute; top:12px; left:12px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-width:200px; backdrop-filter:blur(6px); }
+  .hud h1 { font-size:13px; margin:0 0 6px; font-weight:600; letter-spacing:.02em; display:flex; align-items:center; gap:8px; }
+  .live { display:none; font-size:10.5px; font-weight:700; letter-spacing:.08em; color:#1b1305; background:var(--accent); border-radius:4px; padding:1px 6px; }
+  .live.on { display:inline-block; }
   .stat { display:flex; justify-content:space-between; gap:16px; font-variant-numeric:tabular-nums; }
   .stat span:first-child { color:var(--muted); }
   .big { font-size:26px; font-weight:700; color:var(--accent); }
+  .meter { height:6px; background:#1d2638; border-radius:3px; overflow:hidden; margin:3px 0 4px; }
+  .meter i { display:block; height:100%; width:100%; background:var(--ok); border-radius:3px; transition:width .2s; }
+  .opt { display:none; }
+  .opt.on { display:block; }
+  .stat.opt.on { display:flex; }
+  .wind { display:inline-block; transform-origin:center; }
   .ctrl { position:absolute; left:12px; right:12px; bottom:12px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:8px 10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .ctrl input[type=range] { flex:1; min-width:120px; accent-color:var(--accent); }
+  .ctrl .note { color:var(--muted); flex:1; }
   button, select { background:#1d2638; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 10px; font:inherit; cursor:pointer; }
   button:hover { border-color:var(--accent); }
   .joints { position:absolute; top:12px; right:12px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; width:210px; }
@@ -23,17 +32,26 @@
   .bar { height:8px; background:#1d2638; border-radius:4px; position:relative; overflow:hidden; }
   .bar i { position:absolute; top:0; bottom:0; width:3px; margin-left:-1.5px; background:var(--accent); border-radius:2px; }
   .bar::after { content:""; position:absolute; left:50%; top:0; bottom:0; width:1px; background:var(--line); }
+  .wait { position:absolute; inset:0; display:none; align-items:center; justify-content:center; color:var(--muted); font-size:15px; text-align:center; padding:24px; pointer-events:none; }
+  .wait.on { display:flex; }
   @media (max-width:640px){ .joints{ display:none; } }
+  .embed .joints { display:none; }
+  .embed .hud { padding:8px 10px; min-width:180px; font-size:12px; }
+  .embed .big { font-size:20px; }
 </style>
 </head>
 <body>
 <div class="hud">
-  <h1 id="title">Learned flapping flight</h1>
+  <h1><span id="title">Learned flapping flight</span><span class="live" id="liveTag">LIVE</span></h1>
   <div class="stat"><span>Rings passed</span><span class="big" id="rings">0</span></div>
+  <div class="stat opt" id="itRow"><span>Training iteration</span><span id="iter">–</span></div>
   <div class="stat"><span>Time</span><span id="time">0.0 s</span></div>
   <div class="stat"><span>Airspeed</span><span id="speed">0</span></div>
   <div class="stat"><span>Altitude</span><span id="alt">0</span></div>
   <div class="stat"><span>Next ring</span><span id="dist">0</span></div>
+  <div class="stat opt" id="powRow"><span>Flapping power</span><span id="power">–</span></div>
+  <div class="opt" id="enRow"><div class="stat"><span>Energy</span><span id="energy">100%</span></div><div class="meter"><i id="enBar"></i></div></div>
+  <div class="stat opt" id="windRow"><span>Wind / lift</span><span><span class="wind" id="windArrow">➜</span> <span id="wind">–</span></span></div>
   <div class="stat"><span>Status</span><span id="status">flying</span></div>
 </div>
 <div class="joints"><h2>Controls (joint angles)</h2><div id="jbars"></div></div>
@@ -43,67 +61,62 @@
   <select id="cam"><option value="chase">Chase cam</option><option value="side">Side cam</option><option value="orbit">Wide orbit</option></select>
   <select id="rate"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
   <input type="range" id="scrub" min="0" max="1" value="0">
+  <span class="note" id="liveNote" style="display:none">Flying the newest checkpoint in real time. The bird switches to each new checkpoint as training saves it.</span>
 </div>
+<div class="wait" id="wait"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 const DATA = __DATA__;
-const M = DATA.meta;
-const K = M.scale || 1;
-if (M.species) document.getElementById('title').textContent = M.species[0].toUpperCase() + M.species.slice(1) + (M.wing_momentum ? ' · wing momentum' : ' · massless wings');                                   // bird size relative to the original hawk
-const COL = (M.colors || ['#3b4a63', '#d9dde6', '#2d3a50']).map(c => new THREE.Color(c));
-const TAIL_A = M.tail_area || [0.02, 0.06];
+const LIVE = !!DATA.live;
+if (window.self !== window.top) document.body.classList.add('embed');   // inside the hub: compact
 const $ = id => document.getElementById(id);
+let M = null, K = 1, COL, TAIL_A;
 
+// ---------------------------------------------------------------- scene
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 document.body.prepend(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x9cc4e4);
-scene.fog = new THREE.Fog(0x9cc4e4, 60, 260);
-const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
+scene.fog = new THREE.Fog(0x9cc4e4, 60, 320);
+const camera = new THREE.PerspectiveCamera(60, 1, 0.05, 1500);
 camera.up.set(0, 0, 1);                       // simulation is z-up
 scene.add(new THREE.HemisphereLight(0xdfefff, 0x5a6b3a, 0.9));
 const sun = new THREE.DirectionalLight(0xffffff, 0.8); sun.position.set(30, -20, 60); scene.add(sun);
-
-// ground
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(4000, 4000), new THREE.MeshLambertMaterial({ color: 0x6f8f4e }));
 scene.add(ground);
 const grid = new THREE.GridHelper(4000, 400, 0x51703a, 0x5f7f45); grid.rotation.x = Math.PI / 2; grid.position.z = 0.02; scene.add(grid);
 
-// ---- bird model (same kinematics as the simulator) ----
+// ---------------------------------------------------------------- bird
+let bird = null, shadow = null;
 function makeBird() {
-  const bird = new THREE.Group();
+  const g = new THREE.Group();
   const bodyMat = new THREE.MeshLambertMaterial({ color: COL[0] });
   const body = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), bodyMat);
-  body.scale.set(0.24 * K, 0.07 * K, 0.075 * K); bird.add(body);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.06 * K, 14, 10), bodyMat); head.position.set(0.22 * K, 0, 0.03 * K); bird.add(head);
+  body.scale.set(0.24 * K, 0.07 * K, 0.075 * K); g.add(body);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.06 * K, 14, 10), bodyMat); head.position.set(0.22 * K, 0, 0.03 * K); g.add(head);
   const beak = new THREE.Mesh(new THREE.ConeGeometry(0.02 * K, 0.08 * K, 8), new THREE.MeshLambertMaterial({ color: 0xffb547 }));
-  beak.rotation.z = -Math.PI / 2; beak.position.set(0.3 * K, 0, 0.025 * K); bird.add(beak);
-
+  beak.rotation.z = -Math.PI / 2; beak.position.set(0.3 * K, 0, 0.025 * K); g.add(beak);
   const wings = [];
   for (const sign of [1, -1]) {
     const joint = new THREE.Group();
     joint.position.set(M.shoulder[0], sign * M.shoulder[1], M.shoulder[2]);
     joint.rotation.order = 'XZY';             // R = Rx(flap) Rz(sweep) Ry(twist)
-    const g = new THREE.BufferGeometry();
+    const geo = new THREE.BufferGeometry();
     const S = M.half_span, C = M.chord, root = 1.15 * C, tip = 0.85 * C;
     const v = new Float32Array([ root/2,0,0,  -root/2,0,0,  -tip/2,sign*S,0,   root/2,0,0,  -tip/2,sign*S,0,  tip/2,sign*S,0 ]);
-    g.setAttribute('position', new THREE.BufferAttribute(v, 3)); g.computeVertexNormals();
-    const wing = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: sign > 0 ? COL[1] : COL[1].clone().multiplyScalar(0.92), side: THREE.DoubleSide }));
-    joint.add(wing); bird.add(joint); wings.push({ joint, sign });
+    geo.setAttribute('position', new THREE.BufferAttribute(v, 3)); geo.computeVertexNormals();
+    const wing = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color: sign > 0 ? COL[1] : COL[1].clone().multiplyScalar(0.92), side: THREE.DoubleSide }));
+    joint.add(wing); g.add(joint); wings.push({ joint, sign });
   }
   const tail = new THREE.Group(); tail.position.set(...M.tail_pos); tail.rotation.order = 'XYZ';
   const tg = new THREE.BufferGeometry();
   tg.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0.12,0,0, -0.12,1,0, -0.12,-1,0]), 3)); tg.computeVertexNormals();
   const tailMesh = new THREE.Mesh(tg, new THREE.MeshLambertMaterial({ color: COL[2], side: THREE.DoubleSide }));
-  tail.add(tailMesh); bird.add(tail);
-  bird.userData = { wings, tail, tailMesh };
-  return bird;
+  tail.add(tailMesh); g.add(tail);
+  g.userData = { wings, tail, tailMesh };
+  return g;
 }
-const bird = makeBird(); scene.add(bird);
-const shadow = new THREE.Mesh(new THREE.CircleGeometry(0.6 * K, 20), new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.25 }));
-shadow.position.z = 0.05; scene.add(shadow);
-
 function poseBird(f) {
   bird.position.set(f[0], f[1], f[2]);
   bird.quaternion.set(f[4], f[5], f[6], f[3]);
@@ -118,61 +131,141 @@ function poseBird(f) {
   shadow.position.x = f[0]; shadow.position.y = f[1];
 }
 
-// ---- rings, trail ----
+// ---------------------------------------------------------------- rings, thermals, trail
 const ringGroup = new THREE.Group(); scene.add(ringGroup);
-let trail;
 const ringMats = {
   next: new THREE.MeshLambertMaterial({ color: 0xffb547, emissive: 0x6b3d00 }),
   done: new THREE.MeshLambertMaterial({ color: 0x5fd38d, transparent: true, opacity: 0.35 }),
 };
-const ringGeo = new THREE.TorusGeometry(M.ring_radius, 0.12, 10, 48);
-let B, ringMeshes = [];
-function loadBird(i) {
-  B = DATA.birds[i];
-  ringGroup.clear(); ringMeshes = [];
-  for (const r of B.rings) {
-    const m = new THREE.Mesh(ringGeo, ringMats.next);
-    m.position.set(...r.p);
-    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3(...r.n));
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, r.p[2] - M.ring_radius, 6), new THREE.MeshLambertMaterial({ color: 0x8892a6 }));
-    pole.rotation.x = Math.PI / 2; pole.position.set(r.p[0], r.p[1], (r.p[2] - M.ring_radius) / 2);
-    ringGroup.add(m); ringGroup.add(pole); ringMeshes.push({ m, pole, r });
+const poleMat = new THREE.MeshLambertMaterial({ color: 0x8892a6 });
+let ringGeo = null, ringMeshes = [];
+function addRingMesh(r) {
+  const m = new THREE.Mesh(ringGeo, ringMats.next);
+  m.position.set(...r.p);
+  m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3(...r.n));
+  const h = Math.max(0.1, r.p[2] - M.ring_radius);
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, h, 6), poleMat);
+  pole.rotation.x = Math.PI / 2; pole.position.set(r.p[0], r.p[1], h / 2);
+  ringGroup.add(m); ringGroup.add(pole); ringMeshes.push({ m, pole, r });
+}
+const thermGroup = new THREE.Group(); scene.add(thermGroup);
+let thermShown = null;
+function showThermals(th) {
+  if (th === thermShown) return; thermShown = th;
+  thermGroup.clear();
+  for (const [x, y, w, rad] of th || []) {
+    const top = M.thermal_top || 120;
+    const col = new THREE.Mesh(new THREE.CylinderGeometry(rad * 0.7, rad, top, 32, 1, true),
+      new THREE.MeshBasicMaterial({ color: 0xffe0a0, transparent: true, opacity: 0.025 + 0.015 * w, depthWrite: false, side: THREE.DoubleSide }));
+    col.rotation.x = Math.PI / 2; col.position.set(x, y, top / 2); thermGroup.add(col);
+    const disk = new THREE.Mesh(new THREE.CircleGeometry(rad, 32), new THREE.MeshBasicMaterial({ color: 0xffd27a, transparent: true, opacity: 0.18, depthWrite: false }));
+    disk.position.set(x, y, 0.06); thermGroup.add(disk);
   }
-  if (trail) scene.remove(trail);
-  const pts = new Float32Array(B.frames.length * 3);
-  B.frames.forEach((f, k) => pts.set([f[0], f[1], f[2]], k * 3));
-  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pts, 3));
-  trail = new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7 }));
-  scene.add(trail);
-  $('scrub').max = B.frames.length - 1;
-  t = 0;
+}
+const TRAIL = 400;
+const trailGeo = new THREE.BufferGeometry();
+trailGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(TRAIL * 3), 3));
+const trail = new THREE.Line(trailGeo, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7 }));
+trail.frustumCulled = false; scene.add(trail);
+
+// ---------------------------------------------------------------- setup from meta
+function setMeta(meta) {
+  const rebuild = !M || meta.species !== M.species || meta.half_span !== M.half_span || meta.ring_radius !== M.ring_radius;
+  M = meta;
+  K = M.scale || 1;
+  COL = (M.colors || ['#3b4a63', '#d9dde6', '#2d3a50']).map(c => new THREE.Color(c));
+  TAIL_A = M.tail_area || [0.02, 0.06];
+  if (M.species) {
+    const phys = M.physics === 'wings-v2' ? 'full wing dynamics' : M.physics === 'wings-v1' || M.wing_momentum ? 'wing momentum' : 'massless wings';
+    $('title').textContent = M.species[0].toUpperCase() + M.species.slice(1) + ' · ' + phys;
+  }
+  $('enRow').classList.toggle('on', !!M.energy_budget);
+  $('windRow').classList.toggle('on', !!M.soaring);
+  $('powRow').classList.toggle('on', !!M.wing_momentum || !!M.physics && M.physics !== 'massless');
+  if (rebuild) {
+    if (bird) scene.remove(bird);
+    if (shadow) scene.remove(shadow);
+    bird = makeBird(); scene.add(bird);
+    shadow = new THREE.Mesh(new THREE.CircleGeometry(0.6 * K, 20), new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.25 }));
+    shadow.position.z = 0.05; scene.add(shadow);
+    ringGeo = new THREE.TorusGeometry(M.ring_radius, 0.12 * Math.max(1, K * 0.8), 10, 48);
+  }
 }
 
-// ---- joint bars ----
+// ---------------------------------------------------------------- joint bars
 const JN = ['L flap', 'L sweep', 'L twist', 'R flap', 'R sweep', 'R twist', 'Tail pitch', 'Tail tilt', 'Tail spread'];
 $('jbars').innerHTML = JN.map((n, i) => `<div class="jrow"><span>${n}</span><div class="bar"><i id="jb${i}"></i></div></div>`).join('');
 
-// ---- UI ----
-DATA.birds.forEach((b, i) => {
-  const n = b.rings.filter(r => r.t1 !== null).length;
-  $('bird').add(new Option(`Bird ${i + 1} · ${n} rings`, i));
-});
-let playing = true, t = 0, camAngle = 0;
-$('play').onclick = () => { playing = !playing; $('play').textContent = playing ? 'Pause' : 'Play'; };
-$('bird').onchange = e => loadBird(+e.target.value);
-$('scrub').oninput = e => { t = +e.target.value; };
-loadBird(0);
+// ---------------------------------------------------------------- data: replay or live stream
+// B = { frames, base (index of frames[0]), rings [{p,n,t0,t1}], thermals [[t, list]], wind [speed, dx, dy], end }
+let B = null, t = 0, playing = true, camAngle = 0;
+function loadBird(i) {
+  B = Object.assign({ base: 0, thermals: [], wind: [0, 1, 0] }, DATA.birds[i]);
+  ringGroup.clear(); ringMeshes = [];
+  for (const r of B.rings) addRingMesh(r);
+  $('scrub').max = B.frames.length - 1;
+  t = 0; thermShown = null;
+}
+function newLiveEpisode(msg) {
+  B = { frames: [], base: msg.k, rings: [], thermals: msg.th ? [[msg.k, msg.th]] : [], wind: msg.wind || [0, 1, 0], end: null };
+  ringGroup.clear(); ringMeshes = [];
+  if (msg.ring) { const r = { p: msg.ring.p, n: msg.ring.n, t0: msg.k, t1: null }; B.rings.push(r); addRingMesh(r); }
+  thermShown = null;
+}
+if (!LIVE) {
+  setMeta(DATA.meta);
+  DATA.birds.forEach((b, i) => {
+    const n = b.rings.filter(r => r.t1 !== null).length;
+    $('bird').add(new Option(`Bird ${i + 1} · ${n} rings`, i));
+  });
+  $('play').onclick = () => { playing = !playing; $('play').textContent = playing ? 'Pause' : 'Play'; };
+  $('bird').onchange = e => loadBird(+e.target.value);
+  $('scrub').oninput = e => { t = +e.target.value; };
+  loadBird(0);
+} else {
+  for (const id of ['play', 'bird', 'rate', 'scrub']) $(id).style.display = 'none';
+  $('liveNote').style.display = ''; $('liveTag').classList.add('on'); $('itRow').classList.add('on');
+  const wait = txt => { $('wait').textContent = txt; $('wait').classList.toggle('on', !!txt); };
+  wait('Connecting…');
+  const es = new EventSource(DATA.stream || '/api/live/stream');
+  es.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.t === 'wait') wait(msg.text || 'Waiting for the first checkpoint (saved at iteration 10)…');
+    else if (msg.t === 'meta') { setMeta(msg.meta); $('iter').textContent = msg.meta.iter; wait(''); }
+    else if (msg.t === 'reset') newLiveEpisode(msg);
+    else if (!B) return;
+    else if (msg.t === 'f') {
+      B.frames.push(msg.f);
+      if (B.frames.length > 6000) { B.frames.splice(0, 1000); B.base += 1000; }
+      t = B.base + B.frames.length - 1;
+    } else if (msg.t === 'ring') {
+      const last = B.rings[B.rings.length - 1]; if (last) last.t1 = msg.k;
+      const r = { p: msg.p, n: msg.n, t0: msg.k, t1: null }; B.rings.push(r); addRingMesh(r);
+      if (B.rings.length > 40) { const old = ringMeshes.shift(); ringGroup.remove(old.m); ringGroup.remove(old.pole); B.rings.shift(); }
+    } else if (msg.t === 'th') B.thermals.push([msg.k, msg.th]);
+    else if (msg.t === 'end') B.end = msg.why;
+    else if (msg.t === 'stopped') wait(msg.text || 'Live view stopped.');
+  };
+  es.onerror = () => wait('Live view disconnected. It reconnects automatically while the hub is running.');
+}
 
+// ---------------------------------------------------------------- render loop
 const camPos = new THREE.Vector3(), tmp = new THREE.Vector3();
 let last = performance.now();
 function frame(now) {
-  const dtw = Math.min(0.1, (now - last) / 1000); last = now;
+  const dtw = Math.max(0, Math.min(0.1, (now - last) / 1000)); last = now;   // first rAF stamp can precede `last`
+  requestAnimationFrame(frame);
+  if (!B || !M || !B.frames.length) { renderer.render(scene, camera); return; }
   const N = B.frames.length;
-  if (playing) { t += dtw / M.dt * +$('rate').value; if (t >= N - 1) t = 0; }
-  const k = Math.floor(t), f = B.frames[k];
+  if (!LIVE && playing) { t += dtw / M.dt * +$('rate').value; if (t >= N - 1) t = 0; }
+  t = Math.min(Math.max(t, 0), N - 1);
+  const k = LIVE ? B.base + N - 1 : Math.floor(t), f = B.frames[k - B.base];
   poseBird(f);
-  trail.geometry.setDrawRange(Math.max(0, k - 400), Math.min(k, 400));
-  $('scrub').value = k;
+  // trail: the last TRAIL positions up to k
+  const pos = trailGeo.attributes.position.array, k0 = Math.max(B.base, k - TRAIL + 1);
+  for (let i = k0; i <= k; i++) { const g = B.frames[i - B.base]; pos.set([g[0], g[1], g[2]], (i - k0) * 3); }
+  trailGeo.attributes.position.needsUpdate = true; trailGeo.setDrawRange(0, k - k0 + 1);
+  if (!LIVE) $('scrub').value = k;
 
   let passed = 0, next = null;
   for (const o of ringMeshes) {
@@ -182,14 +275,30 @@ function frame(now) {
     o.m.material = done ? ringMats.done : ringMats.next;
     if (done) passed++; else if (vis && !next) next = o.r;
   }
-  const kp = Math.max(0, k - 1), fp = B.frames[kp];
+  if (M.soaring) {
+    let th = null; for (const [t0, list] of B.thermals) if (t0 <= k) th = list;
+    showThermals(th);
+    const [ws, wx, wy] = B.wind, prof = Math.log(Math.max(f[2], 0.3) / (M.z0 || 0.03)) / Math.log(10 / (M.z0 || 0.03));
+    let up = 0; for (const [x, y, w, rad] of th || []) up += w * Math.exp(-((f[0] - x) ** 2 + (f[1] - y) ** 2) / (rad * rad));
+    up = up / (1 + Math.exp(-((M.thermal_top || 120) - f[2]) / 8)) - 0.3;
+    $('wind').textContent = (ws * prof).toFixed(1) + ' m/s · ' + (up >= 0 ? '+' : '') + up.toFixed(1) + ' m/s';
+    const fp2 = B.frames[Math.max(0, k - B.base - 1)], hd = Math.atan2(f[1] - fp2[1], f[0] - fp2[0]);
+    $('windArrow').style.transform = `rotate(${-(Math.atan2(wy, wx) - hd) * 180 / Math.PI - 90}deg)`;
+  }
+  if (f.length > 16) {
+    $('energy').textContent = Math.round(f[16] * 100) + '%';
+    $('enBar').style.width = (f[16] * 100) + '%';
+    $('enBar').style.background = f[16] < 0.15 ? 'var(--bad)' : f[16] < 0.4 ? 'var(--accent)' : 'var(--ok)';
+  }
+  if (f.length > 17) $('power').textContent = f[17].toFixed(f[17] < 10 ? 1 : 0) + ' W';
+  const kp = Math.max(B.base, k - 1), fp = B.frames[kp - B.base];
   const spd = Math.hypot(f[0] - fp[0], f[1] - fp[1], f[2] - fp[2]) / M.dt;
   $('rings').textContent = passed;
-  $('time').textContent = (k * M.dt).toFixed(1) + ' s';
+  $('time').textContent = ((k - (LIVE ? B.base : 0)) * M.dt).toFixed(1) + ' s';
   $('speed').textContent = spd.toFixed(1) + ' m/s';
   $('alt').textContent = f[2].toFixed(1) + ' m';
   $('dist').textContent = next ? Math.hypot(next.p[0] - f[0], next.p[1] - f[1], next.p[2] - f[2]).toFixed(1) + ' m' : '–';
-  $('status').textContent = (k >= N - 1 && B.end) ? B.end : 'flying';
+  $('status').textContent = B.end && (LIVE || k >= B.base + N - 1) ? B.end : (f.length > 16 && f[16] <= 0.001 ? 'exhausted, gliding' : 'flying');
   for (let i = 0; i < 9; i++) $('jb' + i).style.left = ((f[7 + i] - M.j_lo[i]) / (M.j_hi[i] - M.j_lo[i]) * 100) + '%';
 
   // camera
@@ -204,7 +313,6 @@ function frame(now) {
   camera.position.copy(camPos);
   camera.lookAt(f[0], f[1], f[2]);
   renderer.render(scene, camera);
-  requestAnimationFrame(frame);
 }
 function resize() { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
 addEventListener('resize', resize); resize();

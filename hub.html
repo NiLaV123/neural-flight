@@ -73,6 +73,9 @@
   .sp.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel-2)); }
   .sp.on .ic { color: var(--accent); }
   .tag { display: inline-block; font-size: 11.5px; padding: 1px 7px; border-radius: 999px; background: var(--panel-2); color: var(--muted); margin-left: 6px; font-weight: 500; }
+  .livebox { border-radius: 10px; overflow: hidden; background: var(--panel-2); }
+  .livebox iframe { display: block; width: 100%; height: 420px; border: 0; background: #0e1420; }
+  @media (max-width: 620px) { .livebox iframe { height: 300px; } }
   .note { font-size: 12.5px; color: var(--muted); background: var(--panel-2); border-radius: 8px; padding: 8px 10px; margin-bottom: 12px; display: none; }
   .msg.err { color: var(--bad); }
 
@@ -155,7 +158,18 @@
         </div>
         <label>Bird</label>
         <div class="species" id="species"></div>
-        <div class="field" id="wingField"><label class="check"><input type="checkbox" id="tWings" checked> Wings have mass and momentum</label></div>
+        <div id="wingField">
+          <div class="field"><label for="tPhysics">Wing physics</label>
+            <select id="tPhysics">
+              <option value="wings-v2">Full wing dynamics (recommended)</option>
+              <option value="wings-v1">Simple wing momentum</option>
+              <option value="massless">Massless wings (original)</option>
+            </select></div>
+          <div class="field" id="v2opts">
+            <label class="check"><input type="checkbox" id="tEnergyBudget"> Energy budget: flapping drains energy, rings are food</label>
+            <label class="check" style="margin-top:6px"><input type="checkbox" id="tSoaring"> Soaring: wind, thermals and sinking air</label>
+          </div>
+        </div>
         <div class="note" id="resumeNote">Continuing keeps the bird and wing physics the checkpoint was trained with.</div>
         <div class="field"><label for="tRun">Run name</label><input id="tRun" placeholder="auto (e.g. run_20261116_2140)"></div>
         <div class="row">
@@ -214,6 +228,15 @@
     </section>
 
     <section class="card">
+      <h2>Live view <span class="hint" style="display:flex;gap:8px;align-items:center"><span id="liveStatus"></span>
+        <button class="small watch" id="liveBtn">▶ Start live view</button></span></h2>
+      <div class="body" style="padding-top:10px">
+        <div class="livebox" id="liveBox"><div class="empty" id="liveEmpty">The live view flies the newest checkpoint of the selected run in real time and
+          switches to each new checkpoint as training saves it. It starts automatically when you start training here.</div></div>
+      </div>
+    </section>
+
+    <section class="card">
       <h2>Activity <span class="hint">click a task for its full output</span></h2>
       <div class="body"><div class="jobs" id="jobs"><div class="empty">Nothing running. Start training or make a replay.</div></div></div>
     </section>
@@ -242,7 +265,9 @@ const PRESETS = { quick: { iters: 30, envs: 1024 }, standard: { iters: 300, envs
 let state = null, selRun = null, openJobs = new Set(), metricsKey = "", species = "hawk";
 const BIRD_ICON = { sparrow: 0.55, pigeon: 0.7, hawk: 0.85, eagle: 1, albatross: 1.2 };
 const cap = s => s[0].toUpperCase() + s.slice(1);
-const birdLabel = r => cap(r.species) + (r.wing_dynamics ? "" : " (massless wings)");
+const PHYS = { "wings-v2": "", "wings-v1": "simple wings", massless: "massless wings" };
+const birdLabel = r => cap(r.species) + [PHYS[r.physics], r.energy_budget && "energy", r.soaring && "soaring"]
+  .filter(Boolean).map(x => " · " + x).join("");
 function renderSpecies(info) {
   const el = $("#species"), key = Object.keys(info).join();
   if (el.dataset.key === key) return; el.dataset.key = key;
@@ -252,6 +277,22 @@ function renderSpecies(info) {
       <svg class="ic" viewBox="-16 -16 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M${-14 * w} ${2 - 4 * w}c${5 * w} -2 ${9 * w} 0 ${14 * w} 4c${5 * w} -4 ${9 * w} -6 ${14 * w} -4"/><circle cx="0" cy="${4 + 1}" r="2"/></svg>
       <span><b>${esc(cap(k))}</b><small>${esc(v)}</small></span></button>`;
   }).join("");
+}
+function renderLive(live) {
+  const on = live && live.run, btn = $("#liveBtn"), box = $("#liveBox");
+  $("#liveStatus").textContent = on ? live.run + (live.iter != null ? " · iteration " + live.iter : " · waiting for a checkpoint") : "";
+  btn.textContent = on ? "■ Stop" : "▶ Start live view";
+  btn.dataset.on = on ? "1" : "";
+  btn.disabled = !on && !selRun;
+  const has = !!box.querySelector("iframe");
+  if (on && !has) box.innerHTML = '<iframe src="/live" title="Live view"></iframe>';
+  if (!on && has) box.innerHTML = `<div class="empty">The live view flies the newest checkpoint of the selected run in real time and
+    switches to each new checkpoint as training saves it. It starts automatically when you start training here.</div>`;
+}
+function syncPhysics() {
+  const v2 = $("#tPhysics").value === "wings-v2";
+  for (const id of ["tEnergyBudget", "tSoaring"]) { $("#" + id).disabled = !v2; if (!v2) $("#" + id).checked = false; }
+  $("#v2opts").style.opacity = v2 ? 1 : 0.5;
 }
 function syncResume() {
   const r = !!$("#tResume").value;
@@ -310,7 +351,7 @@ function drawCharts(points) {
     svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
     svg.innerHTML =
       ticks.map(t => `<line class="axis" x1="${L}" x2="${W}" y1="${Y(t)}" y2="${Y(t)}" stroke-dasharray="2 3"/>` +
-        `<text x="${L - 5}" y="${Y(t) + 3}" text-anchor="end">${fmt(t, Math.abs(t) < 10 ? 1 : 0)}</text>`).join("") +
+        `<text x="${L - 5}" y="${Y(t) + 3}" text-anchor="end">${fmt(t, (y1 - y0) < 10 ? 1 : 0)}</text>`).join("") +
       `<text x="${L}" y="${H - 3}">it ${x0}</text><text x="${W}" y="${H - 3}" text-anchor="end">it ${x1}</text>` +
       `<path d="${path}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round"/>` +
       `<line class="cross" y1="${T}" y2="${H - B}" stroke="${col}" stroke-opacity=".4" visibility="hidden"/>` +
@@ -435,6 +476,7 @@ async function refresh() {
     state = await api("/api/state");
     renderEnv(state.env);
     renderSpecies(state.species || {});
+    renderLive(state.live);
     renderRuns(state.runs);
     renderReplays(state.replays);
     openJobs.full = openJobs.full || {};
@@ -451,6 +493,7 @@ async function refresh() {
 
 // ---------------------------------------------------------------- actions
 $("#tResume").onchange = syncResume;
+$("#tPhysics").onchange = syncPhysics;
 $("#runSel").onchange = e => { selRun = e.target.value; metricsKey = ""; renderRuns(state.runs); loadMetrics(true); };
 $("#tStart").onclick = async () => {
   const msg = $("#tMsg"); msg.className = "msg"; msg.textContent = "Starting…";
@@ -459,7 +502,8 @@ $("#tStart").onclick = async () => {
       run: $("#tRun").value, iters: $("#tIters").value, envs: $("#tEnvs").value, steps: $("#tSteps").value,
       lr: $("#tLr").value, device: $("#tDevice").value, snapshots: $("#tSnaps").value,
       resume: $("#tResume").value, no_compile: $("#tNoCompile").checked,
-      species, massless_wings: !$("#tWings").checked, energy_cost: $("#tEnergy").value });
+      species, physics: $("#tPhysics").value, energy_budget: $("#tEnergyBudget").checked,
+      soaring: $("#tSoaring").checked, energy_cost: $("#tEnergy").value });
     msg.textContent = "Training started. The first numbers appear after ~10 iterations.";
     selRun = j.meta.run; metricsKey = ""; openJobs.add(j.id); $("#tRun").value = "";
     refresh();
@@ -478,6 +522,9 @@ document.addEventListener("click", async e => {
   if (!b) return;
   if (b.dataset.sp) { species = b.dataset.sp; document.querySelectorAll(".sp").forEach(x => x.classList.toggle("on", x === b)); return; }
   if (b.id === "watchBtn") return watchRun(selRun);
+  if (b.id === "liveBtn") {
+    await api(b.dataset.on ? "/api/live/stop" : "/api/live/start", { run: selRun }); return refresh();
+  }
   if (b.dataset.watch) { e.stopPropagation(); return watchRun(b.dataset.watch); }
   if (b.dataset.stop) { e.stopPropagation(); await api("/api/stop", { id: +b.dataset.stop }); return refresh(); }
   if (b.dataset.open) { e.stopPropagation(); return openReplay(b.dataset.open); }

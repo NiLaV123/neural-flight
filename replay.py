@@ -33,7 +33,8 @@ def main():
 
     n_steps = int(args.seconds / env.DT)
     birds = [dict(frames=[], rings=[dict(p=env.ring_pos[b].tolist(), n=env.ring_n[b].tolist(), t0=0, t1=None)],
-                  end=None) for b in range(args.birds)]
+                  end=None, wind=[env.wind_ref[b].item(), *env.wind_dir[b].tolist()], thermals=[])
+             for b in range(args.birds)]
     alive = torch.ones(args.birds, dtype=torch.bool)
     r3 = lambda xs: [round(x, 3) for x in xs]
     with torch.no_grad():
@@ -44,7 +45,12 @@ def main():
                 if not alive[b]:
                     continue
                 B = birds[b]
-                B["frames"].append(r3(env.pos[b].tolist()) + r3(env.quat[b].tolist()) + r3(env.joints[b].tolist()))
+                B["frames"].append(r3(env.pos[b].tolist()) + r3(env.quat[b].tolist()) + r3(env.joints[b].tolist())
+                                   + [round(info["energy"][b].item(), 3), round(info["power"][b].item(), 1)])
+                if env.soaring:
+                    th = [r3(x) for x in env.therm[b].tolist()]
+                    if not B["thermals"] or B["thermals"][-1][1] != th:
+                        B["thermals"].append([t, th])
                 if info["passed"][b]:
                     B["rings"][-1]["t1"] = t
                     B["rings"].append(dict(p=env.ring_pos[b].tolist(), n=env.ring_n[b].tolist(), t0=t, t1=None))
@@ -61,7 +67,9 @@ def main():
                 shoulder=list(env.SHOULDER), tail_pos=list(env.TAIL_POS), incidence=env.WING_INCIDENCE,
                 iter=ck.get("iter", 0), j_lo=env.j_lo.tolist(), j_hi=env.j_hi.tolist(),
                 species=env.species, species_info=SPECIES_INFO[env.species], scale=env.SCALE,
-                colors=list(env.COLORS), tail_area=list(env.TAIL_AREA), wing_momentum=env.wing_dynamics)
+                colors=list(env.COLORS), tail_area=list(env.TAIL_AREA), wing_momentum=env.wing_dynamics,
+                physics=env.physics, energy_budget=env.energy_budget, soaring=env.soaring,
+                z0=env.Z0, thermal_top=env.THERMAL_TOP)
     html = open("viewer_template.html", encoding="utf-8").read().replace("__DATA__", json.dumps(dict(meta=meta, birds=birds)))
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(html)

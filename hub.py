@@ -11,6 +11,7 @@ the command line too.
 import argparse
 import ast
 import json
+import queue
 import os
 import re
 
@@ -58,8 +59,10 @@ def run_config(d):
         cfg = json.loads((d / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         cfg = {}
-    return dict(species=cfg.get("species", "hawk"), wing_dynamics=cfg.get("wing_dynamics", False),
-                energy_cost=cfg.get("energy_cost", 0.0))
+    physics = cfg.get("physics") or ("wings-v1" if cfg.get("wing_dynamics", False) else "massless")
+    return dict(species=cfg.get("species", "hawk"), physics=physics, wing_dynamics=physics != "massless",
+                energy_cost=cfg.get("energy_cost", 0.0), energy_budget=cfg.get("energy_budget", False),
+                soaring=cfg.get("soaring", False))
 
 
 def run_dirs():
@@ -248,16 +251,140 @@ def start_training(body):
         if species not in SPECIES:
             raise ValueError(f"unknown species {species}")
         cmd += ["--species", species]
+        physics = body.get("physics", "wings-v2")
         if body.get("massless_wings"):
-            cmd += ["--massless-wings"]
-        elif str(body.get("energy_cost", "")).strip():
+            physics = "massless"
+        if physics not in ("wings-v2", "wings-v1", "massless"):
+            raise ValueError("bad physics")
+        cmd += ["--physics", physics]
+        if physics != "massless" and str(body.get("energy_cost", "")).strip():
             cmd += ["--energy-cost", str(float(body["energy_cost"]))]
+        if physics == "wings-v2":
+            if body.get("energy_budget"):
+                cmd += ["--energy-budget"]
+            if body.get("soaring"):
+                cmd += ["--soaring"]
     if body.get("no_compile"):
         cmd += ["--no-compile"]
     job = Job("train", f"Training runs/{name}" + ("" if body.get("resume") else f" ({body.get('species', 'hawk')})"), cmd, log_file=out / "train.log", meta=dict(run=f"runs/{name}"))
     with LOCK:
         JOBS.append(job)
+    if body.get("live", True):
+        LIVE.start(out)
     return job
+
+
+class LiveView:
+    """Runs live.py for one run and fans its JSON-line stream out to browsers (server-sent events).
+    A browser that connects mid-flight first gets the current flight so far."""
+    MAX_FRAMES = 3000
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc, self.run, self.subs = None, None, []
+        self._clear()
+
+    def _clear(self):
+        self.meta = self.meta_line = self.reset = self.waiting = None
+        self.events, self.frames, self.dropped = [], deque(), 0
+        self.errors = deque(maxlen=20)
+
+    def start(self, run_dir):
+        self.stop(quiet=True)
+        run_dir = Path(run_dir)
+        with self.lock:
+            self._clear()
+            self.run = run_dir.relative_to(ROOT).as_posix()
+            group = (dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if WINDOWS else dict(start_new_session=True))
+            env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+            self.proc = subprocess.Popen([PY, "live.py", "--run", self.run], cwd=ROOT, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                         bufsize=1, env=env, **group)
+            proc = self.proc
+        self._broadcast(json.dumps(dict(t="wait", text="Starting the live view…")))
+        threading.Thread(target=self._pump, args=(proc,), daemon=True).start()
+
+    def stop(self, quiet=False):
+        with self.lock:
+            proc, self.proc, self.run = self.proc, None, None
+        if proc and proc.poll() is None:
+            proc.kill()
+        if not quiet:
+            self._broadcast(json.dumps(dict(t="stopped", text="Live view is off. Start it from the hub.")))
+
+    def status(self):
+        with self.lock:
+            running = self.proc is not None and self.proc.poll() is None
+            return dict(run=self.run if running else None, iter=(self.meta or {}).get("iter") if running else None)
+
+    def _pump(self, proc):
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                self.errors.append(line)                        # warnings / tracebacks from live.py
+                continue
+            kind = msg.get("t")
+            with self.lock:
+                if proc is not self.proc:
+                    return
+                if kind == "meta":
+                    self.meta, self.meta_line = msg["meta"], line
+                elif kind == "wait":
+                    self.waiting = line
+                elif kind == "reset":
+                    self.reset, self.events, self.frames, self.dropped = msg, [], deque(), 0
+                elif kind == "f":
+                    if len(self.frames) >= self.MAX_FRAMES:
+                        self.frames.popleft(); self.dropped += 1
+                    self.frames.append(line)
+                elif kind in ("ring", "th", "end"):
+                    self.events.append(line)
+            self._broadcast(line)
+        proc.wait()
+        with self.lock:
+            crashed = proc is self.proc
+            if crashed:
+                self.proc, self.run = None, None
+        if crashed:
+            why = self.errors[-1] if self.errors else f"exit code {proc.returncode}"
+            self._broadcast(json.dumps(dict(t="stopped", text=f"Live view stopped: {why}")))
+
+    def _broadcast(self, line):
+        with self.lock:
+            subs = list(self.subs)
+        for q in subs:
+            try:
+                q.put_nowait(line)
+            except queue.Full:
+                pass                                            # a stalled browser just misses frames
+
+    def subscribe(self):
+        q = queue.Queue(maxsize=2000)
+        with self.lock:
+            backlog = []
+            if self.meta_line is not None:
+                backlog.append(self.meta_line)
+                if self.reset is not None:
+                    backlog.append(json.dumps(dict(self.reset, k=self.reset["k"] + self.dropped)))
+                    backlog += self.events + list(self.frames)
+            elif self.proc is not None:
+                backlog.append(self.waiting or json.dumps(dict(t="wait", text="Starting the live view…")))
+            else:
+                backlog.append(json.dumps(dict(t="stopped", text="Live view is off. Start it from the hub.")))
+            self.subs.append(q)
+        return q, backlog
+
+    def unsubscribe(self, q):
+        with self.lock:
+            if q in self.subs:
+                self.subs.remove(q)
+
+
+LIVE = LiveView()
 
 
 def start_replay(body):
@@ -301,7 +428,13 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     jobs = [j.info() for j in reversed(JOBS)]
                 return self._send(200, dict(env=ENV_INFO, jobs=jobs, runs=list_runs(), replays=list_replays(),
-                                            species=SPECIES))
+                                            species=SPECIES, live=LIVE.status()))
+            if u.path == "/live":
+                page = (ROOT / "viewer_template.html").read_text(encoding="utf-8")
+                page = page.replace("__DATA__", json.dumps(dict(live=True, stream="/api/live/stream")))
+                return self._send(200, page, "text/html")
+            if u.path == "/api/live/stream":
+                return self._stream()
             if u.path == "/api/metrics":
                 name = q.get("run", [""])[0]
                 d = dict(run_dirs()).get(name)
@@ -321,6 +454,29 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             return self._send(500, dict(error=str(e)))
 
+    def _stream(self):
+        q, backlog = LIVE.subscribe()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write("".join(f"data: {x}\n\n" for x in backlog).encode())
+            self.wfile.flush()
+            while True:
+                try:
+                    chunk = [q.get(timeout=15)]
+                    while not q.empty() and len(chunk) < 200:
+                        chunk.append(q.get_nowait())
+                    self.wfile.write("".join(f"data: {x}\n\n" for x in chunk).encode())
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            LIVE.unsubscribe(q)
+
     def do_POST(self):
         u = urlparse(self.path)
         try:
@@ -328,6 +484,15 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
             if u.path == "/api/train":
                 return self._send(200, start_training(body).info())
+            if u.path == "/api/live/start":
+                d = dict(run_dirs()).get(body.get("run", ""))
+                if d is None:
+                    raise ValueError("unknown run")
+                LIVE.start(d)
+                return self._send(200, LIVE.status())
+            if u.path == "/api/live/stop":
+                LIVE.stop()
+                return self._send(200, dict(ok=True))
             if u.path == "/api/replay":
                 return self._send(200, start_replay(body).info())
             if u.path == "/api/stop":
@@ -354,6 +519,7 @@ def main():
     args = p.parse_args()
 
     threading.Thread(target=check_env, daemon=True).start()
+    ThreadingHTTPServer.daemon_threads = True
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}"
     print(f"Neural Flight Hub running at {url}  (Ctrl+C to quit)")
@@ -366,6 +532,7 @@ def main():
     finally:
         for j in JOBS:
             j.stop()
+        LIVE.stop(quiet=True)
         srv.server_close()
 
 

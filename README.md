@@ -5,6 +5,7 @@ A neural network that learns to fly a bird-like creature through rings. The bird
 - `bird_env.py`: batched PyTorch simulator, runs entirely on the GPU (Apple MPS or CUDA)
 - `train.py`: PPO training
 - `replay.py`: flies a trained policy and writes an interactive 3D replay page
+- `live.py`: flies the newest checkpoint of a run in real time (the hub's live view)
 - `hub.py`: a local dashboard that runs all of the above for you
 
 ## Quick start: the Hub
@@ -16,7 +17,8 @@ start.bat         # Windows (or double-click it)
 
 The first time, this creates `.venv` and installs the requirements. It then opens the **Neural Flight Hub** at http://127.0.0.1:8765, where you can:
 
-- **Train**: pick a bird species and a preset (quick test, standard or long), or set the iterations, parallel birds, device and snapshots yourself. You can start from scratch or continue from any checkpoint.
+- **Train**: pick a bird species, the wing physics, and whether to add the energy budget and soaring. Then pick a preset (quick test, standard or long), or set the iterations, parallel birds, device and snapshots yourself. You can start from scratch or continue from any checkpoint.
+- **Live view**: while a run trains, its newest checkpoint flies in real time right in the hub, and the bird switches to each new checkpoint as it is saved. The live view starts with training, or you can press ▶ Start live view for any run.
 - **Watch it fly**: press ▶ Watch it fly, during or after training, to record the run's best checkpoint and play it in the page.
 - **Watch progress**: see live charts of rings per episode, return, ring radius and episode length, plus the current steps per second, for any run.
 - **Follow activity**: open the output of each running job, or stop a training run.
@@ -53,8 +55,13 @@ Each species gets its own size, inertia, wing and tail area, muscle strength, la
 
 - **Rigid body:** each bird (0.8 kg for the hawk) with gravity, momentum, an inertia tensor and Euler's rotation equations, integrated at 200 Hz.
 - **Blade-element aerodynamics:** each wing is split into 3 segments, plus one surface for the tail. The airflow each segment feels includes the bird's motion, its rotation, and the segment's own motion from the joints, so a downstroke really pushes air. Lift and drag come from the angle of attack, with a stall model.
-- **Wings with momentum:** each wing has mass (7% of the bird) spread along its span. The network sets 9 target angles at 50 Hz. Flap and sweep are driven by torque-limited muscles against the wing's inertia, its aerodynamic load and its weight. Moving the wing also moves the body: a hard downstroke makes the body recoil, and the wing's momentum shows up in the body's motion. Muscle work is tracked as flapping power, which the hub plots. Twist and tail joints are light servos that move toward their targets at a limited speed.
-- **Original model:** use `--massless-wings` for the original model, where every joint is an ideal servo and the wings have no mass. The checkpoints in `checkpoints/` and `runs/fresh/` were trained this way, and they still load and replay with it automatically.
+- **Wing physics** (`--physics`):
+  - `wings-v2` (default): full wing dynamics. Each wing has mass (7% of the bird) spread along its span and chord. Flap, sweep and twist are all driven by torque-limited muscles, against the wing's inertia, its aerodynamic load and its weight. Lift acts just behind the twist axis, so the air pushes on the twist too. The body and wings are solved together each physics step as one 12-degree-of-freedom system: body translation and rotation plus six wing joints. That covers recoil, the time-varying inertia tensor, and centrifugal, Coriolis and gyroscopic coupling. When a wing hits its joint stop, the body takes up the wing's momentum. Muscle work is reported as flapping power.
+  - `wings-v1`: the earlier, simpler model. Flap and sweep have mass and momentum, and twist is a servo.
+  - `massless`: the original model, with ideal servo joints and massless wings. The checkpoints in `checkpoints/` and `runs/fresh/` use it.
+  - Every checkpoint remembers its physics and keeps working with it.
+- **Energy budget** (`--energy-budget`): the bird starts with a reserve of 2,500 J per kg. Muscle work and a resting metabolism drain it, and each ring passed restores 20%. When the reserve runs out, the muscles drop to 10% strength, so the bird has to glide.
+- **Soaring** (`--soaring`): adds wind and rising air. Each episode gets a random wind of up to 7 m/s at 10 m height, with a realistic boundary-layer profile that is stronger higher up. Rising thermals form and dissipate around the bird, and the air sinks gently between them. The bird feels the wind, and its observations include the nearest thermal. Combine soaring with the energy budget to reward birds that gain height in thermals instead of flapping.
 - **Task:** fly through a ring (crossing its plane inside the radius, from the correct side). A new ring then appears 18–35 m ahead at a random angle and height.
 - **Reward:** progress toward the ring, +10 for each pass, −5 for a crash, and a small penalty on control effort. `--energy-cost` can also charge for the muscles' work, which pushes the bird toward an efficient wingbeat.
 
@@ -62,7 +69,7 @@ Each species gets its own size, inertia, wing and tail area, muscle strength, la
 
 ```bash
 uv venv && uv pip install -r requirements.txt
-.venv/bin/python train.py                                  # ~115k steps/s on an M2 GPU
+.venv/bin/python train.py                                  # hawk with full wing dynamics
 .venv/bin/python train.py --resume checkpoints/latest.pt   # continue a run
 ```
 
@@ -85,6 +92,7 @@ This flies the policy in the PyTorch simulator and writes a recorded three.js re
 
 ## Known simplifications
 
-- Wing mass is lumped at the blade-element centres, and its inertia is not added separately to the body's inertia tensor.
-- Twist and tail joints have no mass or aerodynamic hinge load.
+- Each wing segment's mass is modelled as two point masses, and the tail has no mass.
+- The wing integrator is first order. With very violent flapping it loses a little momentum, which shrinks with smaller time steps.
+- Wind is sampled at the bird's position rather than per wing segment, and thermals are smooth columns without turbulence.
 - With massless wings, the learned gait is a fast flutter at about 11 Hz.

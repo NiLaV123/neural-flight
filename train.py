@@ -80,10 +80,11 @@ class ActorCritic(nn.Module):
 
 
 def env_config(ck):
-    """Bird settings stored in a checkpoint. Checkpoints from before species and wing
-    momentum existed are the original massless-wing hawk."""
-    return dict(species=ck.get("species", "hawk"), wing_dynamics=ck.get("wing_dynamics", False),
-                energy_cost=ck.get("energy_cost", 0.0))
+    """Bird settings stored in a checkpoint (or a run's config.json). Older checkpoints predate some
+    settings: no "physics" means wings-v1 if they had wing momentum, else the original massless hawk."""
+    physics = ck.get("physics") or ("wings-v1" if ck.get("wing_dynamics", False) else "massless")
+    return dict(species=ck.get("species", "hawk"), physics=physics, energy_cost=ck.get("energy_cost", 0.0),
+                energy_budget=ck.get("energy_budget", False), soaring=ck.get("soaring", False))
 
 
 def main():
@@ -104,8 +105,13 @@ def main():
     p.add_argument("--out", default="checkpoints")
     p.add_argument("--snapshots", default="", help="comma-separated iterations to save as iter_<N>.pt, e.g. 0,10,30,60")
     p.add_argument("--species", default="hawk", choices=list(SPECIES))
-    p.add_argument("--massless-wings", action="store_true",
-                   help="original model: wings have no mass or momentum (joints are ideal servos)")
+    p.add_argument("--physics", default="wings-v2", choices=list(BirdEnv.PHYSICS),
+                   help="wings-v2: full wing dynamics (default); wings-v1: simpler wing momentum; "
+                        "massless: the original ideal-servo wings")
+    p.add_argument("--massless-wings", action="store_true", help="same as --physics massless")
+    p.add_argument("--energy-budget", action="store_true",
+                   help="muscles drain an energy reserve; rings are food; exhausted birds must glide (wings-v2)")
+    p.add_argument("--soaring", action="store_true", help="wind, thermals and sink (wings-v2)")
     p.add_argument("--energy-cost", type=float, default=0.0,
                    help="reward penalty per joule of muscle work per kg of bird (wing momentum only), e.g. 0.02")
     args = p.parse_args()
@@ -113,15 +119,16 @@ def main():
     dev = pick_device(args.device)
     print("device:", dev)
     torch.manual_seed(0)
-    cfg = dict(species=args.species, wing_dynamics=not args.massless_wings, energy_cost=args.energy_cost)
+    cfg = dict(species=args.species, physics="massless" if args.massless_wings else args.physics,
+               energy_cost=args.energy_cost, energy_budget=args.energy_budget, soaring=args.soaring)
     ck = None
     if args.resume:
         ck = torch.load(args.resume, map_location=dev)
         cfg = env_config(ck)  # a checkpoint only makes sense with the bird it was trained on
     env = BirdEnv(args.envs, dev, compile=not args.no_compile, **cfg)
     env.ring_radius = 2 * env.RING_MIN_R
-    print(f"species: {env.species} | wing momentum: {'on' if env.wing_dynamics else 'off'} | "
-          f"mass {env.MASS} kg | span {2 * env.HALF_SPAN:.2f} m", flush=True)
+    print(f"species: {env.species} | physics: {env.physics} | energy budget: {'on' if env.energy_budget else 'off'} | "
+          f"soaring: {'on' if env.soaring else 'off'} | mass {env.MASS} kg | span {2 * env.HALF_SPAN:.2f} m", flush=True)
     ac = ActorCritic(env.N_OBS, BirdEnv.N_ACT).to(dev)
     opt = torch.optim.Adam(ac.parameters(), lr=args.lr)
     start_it = 0
@@ -131,7 +138,7 @@ def main():
         start_it = ck.get("iter", 0)
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "config.json"), "w", encoding="utf-8") as fh:
-        json.dump(dict(cfg, envs=args.envs), fh, indent=2)
+        json.dump(dict(cfg, wing_dynamics=cfg["physics"] != "massless", envs=args.envs), fh, indent=2)
 
     def checkpoint(it):
         return dict(model=ac.state_dict(), opt=opt.state_dict(), iter=it, ring_radius=env.ring_radius, **cfg)
@@ -145,7 +152,7 @@ def main():
     ep_ret = torch.zeros(N, device=dev)
     ep_len = torch.zeros(N, device=dev)
     stats = dict(ret=[], len=[], rings=[])
-    power_sum, power_n = 0.0, 0
+    power_sum, power_n, energy_sum = 0.0, 0, 0.0
     lr = args.lr
     best_rings = -1.0
 
@@ -164,7 +171,7 @@ def main():
                 buf["obs"][t] = obs; buf["act"][t] = a; buf["logp"][t] = d.log_prob(a).sum(-1)
                 buf["val"][t] = v; buf["rew"][t] = rew; buf["done"][t] = done.float()
                 ep_ret += rew; ep_len += 1
-                power_sum += info["power"].sum(); power_n += N
+                power_sum += info["power"].sum(); power_n += N; energy_sum += info["energy"].sum()
                 if done.any():
                     idx = done.nonzero().squeeze(-1)
                     stats["ret"] += ep_ret[idx].tolist()
@@ -225,7 +232,8 @@ def main():
             print(f"it {it:5d} | sps {T*N/dt:8.0f} | ep_ret {sum(stats['ret'])/n:7.2f} | "
                   f"ep_len {sum(stats['len'])/n:6.0f} | rings/ep {mr:5.2f} | max {max(stats['rings']):3.0f} | "
                   f"ring_r {env.ring_radius:.2f} | std {ac.log_std.exp().mean():.3f} | lr {lr:.1e} | "
-                  f"power {float(power_sum) / max(power_n, 1):7.2f} W", flush=True)
+                  f"power {float(power_sum) / max(power_n, 1):7.2f} W | energy {float(energy_sum) / max(power_n, 1):.2f}",
+                  flush=True)
             if mr > 4 and env.ring_radius > env.RING_MIN_R:
                 env.ring_radius = max(env.RING_MIN_R, env.ring_radius * 0.95)
             ck = checkpoint(it)
@@ -234,7 +242,7 @@ def main():
                 best_rings = mr
                 torch.save(ck, os.path.join(args.out, "best.pt"))
             stats = dict(ret=[], len=[], rings=[])
-            power_sum, power_n = 0.0, 0
+            power_sum, power_n, energy_sum = 0.0, 0, 0.0
         if it in snaps:
             torch.save(checkpoint(it), os.path.join(args.out, f"iter_{it}.pt"))
             print(f"saved snapshot iter_{it}.pt", flush=True)
