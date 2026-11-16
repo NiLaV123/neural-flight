@@ -8,8 +8,8 @@ import json
 
 import torch
 
-from bird_env import BirdEnv
-from train import ActorCritic
+from bird_env import SPECIES_INFO, BirdEnv
+from train import ActorCritic, env_config
 
 
 def main():
@@ -23,10 +23,11 @@ def main():
 
     torch.manual_seed(args.seed)
     ck = torch.load(args.ckpt, map_location="cpu")
-    ac = ActorCritic(BirdEnv.N_OBS, BirdEnv.N_ACT)
+    cfg = env_config(ck)
+    env = BirdEnv(args.birds, "cpu", ring_radius=float(ck.get("ring_radius", 2.5)), **cfg)
+    radius = env.ring_radius
+    ac = ActorCritic(env.N_OBS, BirdEnv.N_ACT)
     ac.load_state_dict(ck["model"]); ac.eval()
-    radius = float(ck.get("ring_radius", 2.5))
-    env = BirdEnv(args.birds, "cpu", ring_radius=radius)
     env.MAX_STEPS = 10 ** 9
     env.RING_TIMEOUT = 10 ** 9
 
@@ -58,7 +59,9 @@ def main():
 
     meta = dict(dt=env.DT, ring_radius=radius, half_span=env.HALF_SPAN, chord=env.CHORD,
                 shoulder=list(env.SHOULDER), tail_pos=list(env.TAIL_POS), incidence=env.WING_INCIDENCE,
-                iter=ck.get("iter", 0), j_lo=env.j_lo.tolist(), j_hi=env.j_hi.tolist())
+                iter=ck.get("iter", 0), j_lo=env.j_lo.tolist(), j_hi=env.j_hi.tolist(),
+                species=env.species, species_info=SPECIES_INFO[env.species], scale=env.SCALE,
+                colors=list(env.COLORS), tail_area=list(env.TAIL_AREA), wing_momentum=env.wing_dynamics)
     html = open("viewer_template.html").read().replace("__DATA__", json.dumps(dict(meta=meta, birds=birds)))
     with open(args.out, "w") as f:
         f.write(html)

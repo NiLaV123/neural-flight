@@ -9,6 +9,7 @@ Uses only the Python standard library. Training and replays run as the same
 the command line too.
 """
 import argparse
+import ast
 import json
 import os
 import re
@@ -32,11 +33,34 @@ PY = sys.executable
 LOG_RE = re.compile(
     r"it\s+(\d+)\s*\|\s*sps\s+([\d.]+)\s*\|\s*ep_ret\s+(-?[\d.]+)\s*\|\s*ep_len\s+([\d.]+)\s*\|\s*"
     r"rings/ep\s+([\d.]+)\s*\|\s*max\s+([\d.]+)\s*\|\s*ring_r\s+([\d.]+)\s*\|\s*std\s+([\d.]+)\s*\|\s*lr\s+([\d.e+-]+)"
+    r"(?:\s*\|\s*power\s+([\d.]+))?"
 )
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 # --------------------------------------------------------------------- runs & files
+def load_species():
+    """Read SPECIES_INFO from bird_env.py without importing torch (keeps the hub instant)."""
+    tree = ast.parse((ROOT / "bird_env.py").read_text())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "SPECIES_INFO" for t in node.targets):
+            return ast.literal_eval(node.value)
+    return {"hawk": "The original bird"}
+
+
+SPECIES = load_species()
+
+
+def run_config(d):
+    """Which bird a run trains. Runs from before species existed are the massless-wing hawk."""
+    try:
+        cfg = json.loads((d / "config.json").read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    return dict(species=cfg.get("species", "hawk"), wing_dynamics=cfg.get("wing_dynamics", False),
+                energy_cost=cfg.get("energy_cost", 0.0))
+
+
 def run_dirs():
     """Every folder that holds checkpoints: `checkpoints/` plus each `runs/<name>/`."""
     out = []
@@ -65,9 +89,10 @@ def parse_log(path):
     for line in text.splitlines():
         m = LOG_RE.search(line)
         if m:
-            it, sps, ret, ln, rings, mx, rr, std, lr = m.groups()
+            it, sps, ret, ln, rings, mx, rr, std, lr, power = m.groups()
             pts.append(dict(it=int(it), sps=float(sps), ret=float(ret), len=float(ln), rings=float(rings),
-                            max=float(mx), ring_r=float(rr), std=float(std), lr=float(lr)))
+                            max=float(mx), ring_r=float(rr), std=float(std), lr=float(lr),
+                            power=float(power) if power else None))
     return pts
 
 
@@ -82,7 +107,7 @@ def list_runs():
         cks = sorted(d.glob("*.pt"), key=ckpt_sort_key)
         pts = parse_log(log_path(d))
         runs.append(dict(
-            name=name,
+            name=name, **run_config(d),
             checkpoints=[dict(path=str(c.relative_to(ROOT)), name=c.name, size=c.stat().st_size,
                               mtime=c.stat().st_mtime) for c in cks],
             last=pts[-1] if pts else None,
@@ -205,9 +230,18 @@ def start_training(body):
         cmd += ["--snapshots", snaps.replace(" ", "")]
     if body.get("resume"):
         cmd += ["--resume", str(safe_ckpt(body["resume"]).relative_to(ROOT))]
+    else:
+        species = body.get("species", "hawk")
+        if species not in SPECIES:
+            raise ValueError(f"unknown species {species}")
+        cmd += ["--species", species]
+        if body.get("massless_wings"):
+            cmd += ["--massless-wings"]
+        elif str(body.get("energy_cost", "")).strip():
+            cmd += ["--energy-cost", str(float(body["energy_cost"]))]
     if body.get("no_compile"):
         cmd += ["--no-compile"]
-    job = Job("train", f"Training runs/{name}", cmd, log_file=out / "train.log", meta=dict(run=f"runs/{name}"))
+    job = Job("train", f"Training runs/{name}" + ("" if body.get("resume") else f" ({body.get('species', 'hawk')})"), cmd, log_file=out / "train.log", meta=dict(run=f"runs/{name}"))
     with LOCK:
         JOBS.append(job)
     return job
@@ -253,7 +287,8 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/state":
                 with LOCK:
                     jobs = [j.info() for j in reversed(JOBS)]
-                return self._send(200, dict(env=ENV_INFO, jobs=jobs, runs=list_runs(), replays=list_replays()))
+                return self._send(200, dict(env=ENV_INFO, jobs=jobs, runs=list_runs(), replays=list_replays(),
+                                            species=SPECIES))
             if u.path == "/api/metrics":
                 name = q.get("run", [""])[0]
                 d = dict(run_dirs()).get(name)

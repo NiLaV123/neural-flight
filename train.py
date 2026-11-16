@@ -3,8 +3,10 @@ PPO training of a bird-flight policy. Simulation, rollouts and learning all run 
 the GPU (Apple MPS, CUDA, or CPU fallback).
 
     python train.py --envs 4096 --iters 3000
+    python train.py --species eagle --out runs/eagle
 """
 import argparse
+import json
 import math
 import os
 import time
@@ -12,7 +14,7 @@ import time
 import torch
 import torch.nn as nn
 
-from bird_env import BirdEnv
+from bird_env import SPECIES, BirdEnv
 
 
 def pick_device(name):
@@ -77,6 +79,13 @@ class ActorCritic(nn.Module):
         return self.actor(self.norm(obs))
 
 
+def env_config(ck):
+    """Bird settings stored in a checkpoint. Checkpoints from before species and wing
+    momentum existed are the original massless-wing hawk."""
+    return dict(species=ck.get("species", "hawk"), wing_dynamics=ck.get("wing_dynamics", False),
+                energy_cost=ck.get("energy_cost", 0.0))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--envs", type=int, default=8192)
@@ -94,31 +103,49 @@ def main():
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--out", default="checkpoints")
     p.add_argument("--snapshots", default="", help="comma-separated iterations to save as iter_<N>.pt, e.g. 0,10,30,60")
+    p.add_argument("--species", default="hawk", choices=list(SPECIES))
+    p.add_argument("--massless-wings", action="store_true",
+                   help="original model: wings have no mass or momentum (joints are ideal servos)")
+    p.add_argument("--energy-cost", type=float, default=0.0,
+                   help="reward penalty per joule of muscle work per kg of bird (wing momentum only), e.g. 0.02")
     args = p.parse_args()
 
     dev = pick_device(args.device)
     print("device:", dev)
     torch.manual_seed(0)
-    env = BirdEnv(args.envs, dev, ring_radius=4.0, compile=not args.no_compile)
-    ac = ActorCritic(BirdEnv.N_OBS, BirdEnv.N_ACT).to(dev)
-    opt = torch.optim.Adam(ac.parameters(), lr=args.lr)
-    start_it = 0
+    cfg = dict(species=args.species, wing_dynamics=not args.massless_wings, energy_cost=args.energy_cost)
+    ck = None
     if args.resume:
         ck = torch.load(args.resume, map_location=dev)
+        cfg = env_config(ck)  # a checkpoint only makes sense with the bird it was trained on
+    env = BirdEnv(args.envs, dev, compile=not args.no_compile, **cfg)
+    env.ring_radius = 2 * env.RING_MIN_R
+    print(f"species: {env.species} | wing momentum: {'on' if env.wing_dynamics else 'off'} | "
+          f"mass {env.MASS} kg | span {2 * env.HALF_SPAN:.2f} m", flush=True)
+    ac = ActorCritic(env.N_OBS, BirdEnv.N_ACT).to(dev)
+    opt = torch.optim.Adam(ac.parameters(), lr=args.lr)
+    start_it = 0
+    if ck is not None:
         ac.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
         env.ring_radius = ck.get("ring_radius", env.ring_radius)
         start_it = ck.get("iter", 0)
     os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, "config.json"), "w") as fh:
+        json.dump(dict(cfg, envs=args.envs), fh, indent=2)
+
+    def checkpoint(it):
+        return dict(model=ac.state_dict(), opt=opt.state_dict(), iter=it, ring_radius=env.ring_radius, **cfg)
 
     snaps = {int(x) for x in args.snapshots.split(",") if x.strip()}
     T, N = args.steps, args.envs
     buf = {k: torch.zeros(T, N, *s, device=dev) for k, s in
-           dict(obs=(BirdEnv.N_OBS,), act=(BirdEnv.N_ACT,), logp=(), val=(), rew=(), done=()).items()}
+           dict(obs=(env.N_OBS,), act=(BirdEnv.N_ACT,), logp=(), val=(), rew=(), done=()).items()}
 
     obs = env.obs()
     ep_ret = torch.zeros(N, device=dev)
     ep_len = torch.zeros(N, device=dev)
     stats = dict(ret=[], len=[], rings=[])
+    power_sum, power_n = 0.0, 0
     lr = args.lr
     best_rings = -1.0
 
@@ -137,6 +164,7 @@ def main():
                 buf["obs"][t] = obs; buf["act"][t] = a; buf["logp"][t] = d.log_prob(a).sum(-1)
                 buf["val"][t] = v; buf["rew"][t] = rew; buf["done"][t] = done.float()
                 ep_ret += rew; ep_len += 1
+                power_sum += info["power"].sum(); power_n += N
                 if done.any():
                     idx = done.nonzero().squeeze(-1)
                     stats["ret"] += ep_ret[idx].tolist()
@@ -196,18 +224,19 @@ def main():
             mr = sum(stats["rings"]) / n
             print(f"it {it:5d} | sps {T*N/dt:8.0f} | ep_ret {sum(stats['ret'])/n:7.2f} | "
                   f"ep_len {sum(stats['len'])/n:6.0f} | rings/ep {mr:5.2f} | max {max(stats['rings']):3.0f} | "
-                  f"ring_r {env.ring_radius:.2f} | std {ac.log_std.exp().mean():.3f} | lr {lr:.1e}", flush=True)
-            if mr > 4 and env.ring_radius > 2.0:
-                env.ring_radius = max(2.0, env.ring_radius * 0.95)
-            ck = dict(model=ac.state_dict(), opt=opt.state_dict(), iter=it, ring_radius=env.ring_radius)
+                  f"ring_r {env.ring_radius:.2f} | std {ac.log_std.exp().mean():.3f} | lr {lr:.1e} | "
+                  f"power {float(power_sum) / max(power_n, 1):7.2f} W", flush=True)
+            if mr > 4 and env.ring_radius > env.RING_MIN_R:
+                env.ring_radius = max(env.RING_MIN_R, env.ring_radius * 0.95)
+            ck = checkpoint(it)
             torch.save(ck, os.path.join(args.out, "latest.pt"))
             if mr > best_rings and n > 50:
                 best_rings = mr
                 torch.save(ck, os.path.join(args.out, "best.pt"))
             stats = dict(ret=[], len=[], rings=[])
+            power_sum, power_n = 0.0, 0
         if it in snaps:
-            torch.save(dict(model=ac.state_dict(), opt=opt.state_dict(), iter=it, ring_radius=env.ring_radius),
-                       os.path.join(args.out, f"iter_{it}.pt"))
+            torch.save(checkpoint(it), os.path.join(args.out, f"iter_{it}.pt"))
             print(f"saved snapshot iter_{it}.pt", flush=True)
 
 

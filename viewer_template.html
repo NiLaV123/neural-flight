@@ -28,7 +28,7 @@
 </head>
 <body>
 <div class="hud">
-  <h1>Learned flapping flight</h1>
+  <h1 id="title">Learned flapping flight</h1>
   <div class="stat"><span>Rings passed</span><span class="big" id="rings">0</span></div>
   <div class="stat"><span>Time</span><span id="time">0.0 s</span></div>
   <div class="stat"><span>Airspeed</span><span id="speed">0</span></div>
@@ -48,6 +48,10 @@
 <script>
 const DATA = __DATA__;
 const M = DATA.meta;
+const K = M.scale || 1;
+if (M.species) document.getElementById('title').textContent = M.species[0].toUpperCase() + M.species.slice(1) + (M.wing_momentum ? ' · wing momentum' : ' · massless wings');                                   // bird size relative to the original hawk
+const COL = (M.colors || ['#3b4a63', '#d9dde6', '#2d3a50']).map(c => new THREE.Color(c));
+const TAIL_A = M.tail_area || [0.02, 0.06];
 const $ = id => document.getElementById(id);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -69,12 +73,12 @@ const grid = new THREE.GridHelper(4000, 400, 0x51703a, 0x5f7f45); grid.rotation.
 // ---- bird model (same kinematics as the simulator) ----
 function makeBird() {
   const bird = new THREE.Group();
-  const bodyMat = new THREE.MeshLambertMaterial({ color: 0x3b4a63 });
+  const bodyMat = new THREE.MeshLambertMaterial({ color: COL[0] });
   const body = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), bodyMat);
-  body.scale.set(0.24, 0.07, 0.075); bird.add(body);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.06, 14, 10), bodyMat); head.position.set(0.22, 0, 0.03); bird.add(head);
-  const beak = new THREE.Mesh(new THREE.ConeGeometry(0.02, 0.08, 8), new THREE.MeshLambertMaterial({ color: 0xffb547 }));
-  beak.rotation.z = -Math.PI / 2; beak.position.set(0.3, 0, 0.025); bird.add(beak);
+  body.scale.set(0.24 * K, 0.07 * K, 0.075 * K); bird.add(body);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.06 * K, 14, 10), bodyMat); head.position.set(0.22 * K, 0, 0.03 * K); bird.add(head);
+  const beak = new THREE.Mesh(new THREE.ConeGeometry(0.02 * K, 0.08 * K, 8), new THREE.MeshLambertMaterial({ color: 0xffb547 }));
+  beak.rotation.z = -Math.PI / 2; beak.position.set(0.3 * K, 0, 0.025 * K); bird.add(beak);
 
   const wings = [];
   for (const sign of [1, -1]) {
@@ -85,19 +89,19 @@ function makeBird() {
     const S = M.half_span, C = M.chord, root = 1.15 * C, tip = 0.85 * C;
     const v = new Float32Array([ root/2,0,0,  -root/2,0,0,  -tip/2,sign*S,0,   root/2,0,0,  -tip/2,sign*S,0,  tip/2,sign*S,0 ]);
     g.setAttribute('position', new THREE.BufferAttribute(v, 3)); g.computeVertexNormals();
-    const wing = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: sign > 0 ? 0xd9dde6 : 0xc9cfdb, side: THREE.DoubleSide }));
+    const wing = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: sign > 0 ? COL[1] : COL[1].clone().multiplyScalar(0.92), side: THREE.DoubleSide }));
     joint.add(wing); bird.add(joint); wings.push({ joint, sign });
   }
   const tail = new THREE.Group(); tail.position.set(...M.tail_pos); tail.rotation.order = 'XYZ';
   const tg = new THREE.BufferGeometry();
   tg.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0.12,0,0, -0.12,1,0, -0.12,-1,0]), 3)); tg.computeVertexNormals();
-  const tailMesh = new THREE.Mesh(tg, new THREE.MeshLambertMaterial({ color: 0x2d3a50, side: THREE.DoubleSide }));
+  const tailMesh = new THREE.Mesh(tg, new THREE.MeshLambertMaterial({ color: COL[2], side: THREE.DoubleSide }));
   tail.add(tailMesh); bird.add(tail);
   bird.userData = { wings, tail, tailMesh };
   return bird;
 }
 const bird = makeBird(); scene.add(bird);
-const shadow = new THREE.Mesh(new THREE.CircleGeometry(0.6, 20), new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.25 }));
+const shadow = new THREE.Mesh(new THREE.CircleGeometry(0.6 * K, 20), new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.25 }));
 shadow.position.z = 0.05; scene.add(shadow);
 
 function poseBird(f) {
@@ -109,8 +113,8 @@ function poseBird(f) {
     w.joint.rotation.set(w.sign * j[o], -(j[o + 2] + M.incidence), w.sign * j[o + 1]);
   }
   bird.userData.tail.rotation.set(j[7], -j[6], 0);
-  const spread = 0.02 + 0.04 * j[8];          // tail area -> width
-  bird.userData.tailMesh.scale.set(1, spread / 0.24 * 1.0 + 0.02, 1);
+  const spread = TAIL_A[0] + (TAIL_A[1] - TAIL_A[0]) * j[8];   // tail area -> width
+  bird.userData.tailMesh.scale.set(K, spread / (0.24 * K) + 0.02 * K, 1);
   shadow.position.x = f[0]; shadow.position.y = f[1];
 }
 
@@ -192,8 +196,9 @@ function frame(now) {
   const mode = $('cam').value;
   const vel = tmp.set(f[0] - fp[0], f[1] - fp[1], 0); if (vel.lengthSq() < 1e-6) vel.set(1, 0, 0); vel.normalize();
   let target;
-  if (mode === 'chase') target = new THREE.Vector3(f[0] - vel.x * 5, f[1] - vel.y * 5, f[2] + 1.6);
-  else if (mode === 'side') target = new THREE.Vector3(f[0] - vel.y * 7, f[1] + vel.x * 7, f[2] + 0.8);
+  const cd = Math.max(0.6, K);
+  if (mode === 'chase') target = new THREE.Vector3(f[0] - vel.x * 5 * cd, f[1] - vel.y * 5 * cd, f[2] + 1.6 * cd);
+  else if (mode === 'side') target = new THREE.Vector3(f[0] - vel.y * 7 * cd, f[1] + vel.x * 7 * cd, f[2] + 0.8 * cd);
   else { camAngle += dtw * 0.15; target = new THREE.Vector3(f[0] + 35 * Math.cos(camAngle), f[1] + 35 * Math.sin(camAngle), f[2] + 14); }
   camPos.lerp(target, camPos.lengthSq() === 0 ? 1 : 0.08);
   camera.position.copy(camPos);
