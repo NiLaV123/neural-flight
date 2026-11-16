@@ -36,7 +36,7 @@ LOG_RE = re.compile(
     r"rings/ep\s+([\d.]+)\s*\|\s*max\s+([\d.]+)\s*\|\s*ring_r\s+([\d.]+)\s*\|\s*std\s+([\d.]+)\s*\|\s*lr\s+([\d.e+-]+)"
     r"(?:\s*\|\s*power\s+([\d.]+))?"
 )
-NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$")   # no leading dot: ".." would escape runs/
 
 
 # --------------------------------------------------------------------- runs & files
@@ -220,8 +220,12 @@ def start_training(body):
             raise ValueError("a training run is already going; stop it first")
     name = body.get("run", "").strip() or time.strftime("run_%Y%m%d_%H%M%S")
     if not NAME_RE.match(name):
-        raise ValueError("run name may only use letters, numbers, '-', '_' and '.'")
+        raise ValueError("run name may only use letters, numbers, '-', '_' and '.' (not at the start)")
     out = RUNS_DIR / name
+    resume_dir = safe_ckpt(body["resume"]).parent if body.get("resume") else None
+    if out.is_dir() and any(out.glob("*.pt")) and resume_dir != out.resolve():
+        raise ValueError(f"runs/{name} already has checkpoints; pick another name, "
+                         f"or use Continue training on one of its checkpoints")
     out.mkdir(parents=True, exist_ok=True)
     cmd = [PY, "train.py", "--out", str(out.relative_to(ROOT))]
     for key, flag, typ in [("envs", "--envs", int), ("iters", "--iters", int), ("steps", "--steps", int),
