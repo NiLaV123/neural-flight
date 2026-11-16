@@ -10,6 +10,7 @@ the command line too.
 """
 import argparse
 import ast
+import shutil
 import json
 import queue
 import os
@@ -215,6 +216,14 @@ def check_env():
     except Exception as e:  # noqa: BLE001
         ENV_INFO.update(status="missing", error=str(e))
     ENV_INFO["python"] = PY
+    # an NVIDIA GPU that PyTorch isn't using (CPU-only build, or too old for the card)
+    if ENV_INFO.get("status") == "ok" and ENV_INFO.get("device") != "cuda" and shutil.which("nvidia-smi"):
+        try:
+            name = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True,
+                                  text=True, timeout=30).stdout.strip().splitlines()[0]
+        except (OSError, subprocess.SubprocessError, IndexError):
+            name = "NVIDIA GPU"
+        ENV_INFO["unused_gpu"] = name
 
 
 def start_training(body):

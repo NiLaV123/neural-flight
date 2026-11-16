@@ -1,5 +1,5 @@
 @echo off
-rem One command to set everything up (first time only) and open the Neural Flight Hub on Windows.
+rem One command to set everything up and open the Neural Flight Hub on Windows.
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
   echo First run: creating .venv and installing requirements...
@@ -7,6 +7,8 @@ if not exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" -m pip install --upgrade pip
   ".venv\Scripts\python.exe" setup_env.py || goto :fail
 )
+rem every start: make sure PyTorch can use the NVIDIA GPU (replaces a CPU-only build automatically)
+".venv\Scripts\python.exe" setup_env.py --ensure
 ".venv\Scripts\python.exe" hub.py %*
 goto :eof
 

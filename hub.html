@@ -391,7 +391,15 @@ function renderEnv(env) {
   const pill = $("#envPill");
   if (env.status === "ok") pill.innerHTML = `<span class="dot ok"></span>PyTorch ${esc(env.torch)} · ${esc(env.device.toUpperCase())}`;
   else if (env.status === "missing") pill.innerHTML = `<span class="dot bad"></span>PyTorch missing`;
-  $("#setup").style.display = env.status === "missing" ? "block" : "none";
+  if (env.unused_gpu) pill.innerHTML = `<span class="dot bad"></span>PyTorch ${esc(env.torch)} · CPU (GPU not used)`;
+  $("#setup").style.display = env.status === "missing" || env.unused_gpu ? "block" : "none";
+  if (env.unused_gpu && !renderEnv.gpuMsg) {
+    renderEnv.gpuMsg = true;
+    $("#setup").innerHTML = `<b>Your ${esc(env.unused_gpu)} isn't being used.</b>
+      <div style="margin-top:6px;font-size:13px">This PyTorch is a CPU-only build, or too old for your card, so training runs on the CPU.
+      Close the hub and start it with <code>start.bat</code>: it installs the right GPU build automatically.
+      Or run <code>.venv\\Scripts\\python setup_env.py --ensure</code>, then restart the hub.</div>`;
+  }
   if (env.status === "ok" && !renderEnv.done) { $("#tDevice").value = "auto"; renderEnv.done = true; }
 }
 function fillCkptSelect(sel, runs, keepEmpty) {
