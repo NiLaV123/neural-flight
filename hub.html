@@ -182,7 +182,7 @@
           <div class="row">
             <div class="field"><label for="tDevice">Device</label>
               <select id="tDevice"><option value="auto">Auto</option><option value="mps">Apple GPU (mps)</option><option value="cuda">NVIDIA (cuda)</option><option value="cpu">CPU</option></select></div>
-            <div class="field"><label for="tLr">Learning rate</label><input id="tLr" type="number" step="0.0001" value="0.0003"></div>
+            <div class="field"><label for="tLr">Learning rate</label><input id="tLr" type="number" step="any" placeholder="Auto"></div>
           </div>
           <div class="row">
             <div class="field"><label for="tSteps">Rollout length</label><input id="tSteps" type="number" value="32"></div>
@@ -333,7 +333,7 @@ const CHARTS = [
 const POWER_CHART = { key: "power", title: "Flapping power (W)", color: "--chart-4", d: 1 };
 function drawCharts(points) {
   const el = $("#charts");
-  if (!points.length) { el.innerHTML = `<div class="empty" style="grid-column:1/-1">No training log for this run yet. Progress appears here every 10 iterations.</div>`; return; }
+  if (!points.length) { el.innerHTML = `<div class="empty" style="grid-column:1/-1">No completed episodes have been reported yet.</div>`; return; }
   const charts = points.some(p => p.power != null) ? [...CHARTS.slice(0, 3), POWER_CHART] : CHARTS;
   points = points.filter(p => charts.every(c => p[c.key] != null));
   el.innerHTML = charts.map((c, i) => `<div class="chart" data-i="${i}"><div class="t"><span>${c.title}</span><b></b></div><svg></svg></div>`).join("");
@@ -512,7 +512,7 @@ $("#tStart").onclick = async () => {
       resume: $("#tResume").value, no_compile: $("#tNoCompile").checked,
       species, physics: $("#tPhysics").value, energy_budget: $("#tEnergyBudget").checked,
       soaring: $("#tSoaring").checked, energy_cost: $("#tEnergy").value });
-    msg.textContent = "Training started. The first numbers appear after ~10 iterations.";
+    msg.textContent = "Training started. Live flight is available after the first checkpoint. Metrics appear once birds complete episodes.";
     selRun = j.meta.run; metricsKey = ""; openJobs.add(j.id); $("#tRun").value = "";
     refresh();
   } catch (e) { msg.className = "msg err"; msg.textContent = e.message; }

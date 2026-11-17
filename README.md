@@ -80,6 +80,8 @@ The training setup:
 - **Ring curriculum:** rings start at 4 m radius and shrink to 2 m as the birds improve.
 - **Learning speed:** it learns to fly through rings in about 150–200 iterations (around 10 minutes).
 
+`latest.pt` is saved after iteration 0, every 10 iterations after that, and at the end of the run. Even a short run with no completed episodes leaves a checkpoint for replay or resuming. Episode metrics appear once birds complete episodes. `--resume` starts at the iteration after the one stored in the checkpoint, and `--iters` sets how many additional iterations to train.
+
 On macOS, use `caffeinate -i` so the machine doesn't sleep mid-run.
 
 ## Replays

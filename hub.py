@@ -10,12 +10,12 @@ the command line too.
 """
 import argparse
 import ast
-import shutil
 import json
-import queue
+import math
 import os
+import queue
 import re
-
+import shutil
 import signal
 import subprocess
 import sys
@@ -194,7 +194,7 @@ class Job:
     def info(self, full=False):
         d = dict(id=self.id, kind=self.kind, title=self.title, status=self.status, code=self.code,
                  started=self.started, ended=self.ended, meta=self.meta, cmd=" ".join(self.cmd[1:]),
-                 tail=list(self.lines)[-(400 if full else 6):])
+                 tail=list(self.lines.copy())[-(400 if full else 6):])
         return d
 
 
@@ -227,23 +227,20 @@ def check_env():
 
 
 def start_training(body):
-    with LOCK:
-        if any(j.kind == "train" and j.status == "running" for j in JOBS):
-            raise ValueError("a training run is already going; stop it first")
     name = body.get("run", "").strip() or time.strftime("run_%Y%m%d_%H%M%S")
-    if not NAME_RE.match(name):
+    if not NAME_RE.fullmatch(name):
         raise ValueError("run name may only use letters, numbers, '-', '_' and '.' (not at the start)")
     out = RUNS_DIR / name
-    resume_dir = safe_ckpt(body["resume"]).parent if body.get("resume") else None
-    if out.is_dir() and any(out.glob("*.pt")) and resume_dir != out.resolve():
-        raise ValueError(f"runs/{name} already has checkpoints; pick another name, "
-                         f"or use Continue training on one of its checkpoints")
-    out.mkdir(parents=True, exist_ok=True)
+    resume = safe_ckpt(body["resume"]) if body.get("resume") else None
+    title = f"Training runs/{name}"
     cmd = [PY, "train.py", "--out", str(out.relative_to(ROOT))]
     for key, flag, typ in [("envs", "--envs", int), ("iters", "--iters", int), ("steps", "--steps", int),
                            ("lr", "--lr", float)]:
         if str(body.get(key, "")).strip():
-            cmd += [flag, str(typ(body[key]))]
+            value = typ(body[key])
+            if value <= 0 or (typ is float and not math.isfinite(value)):
+                raise ValueError(f"{key} must be positive and finite")
+            cmd += [flag, str(value)]
     dev = body.get("device", "auto")
     if dev not in ("auto", "mps", "cuda", "cpu"):
         raise ValueError("bad device")
@@ -252,13 +249,14 @@ def start_training(body):
     if snaps:
         if not re.fullmatch(r"\d+(\s*,\s*\d+)*", snaps):
             raise ValueError("snapshots should look like 0,10,50,100")
-        cmd += ["--snapshots", snaps.replace(" ", "")]
-    if body.get("resume"):
-        cmd += ["--resume", str(safe_ckpt(body["resume"]).relative_to(ROOT))]
+        cmd += ["--snapshots", snaps]
+    if resume:
+        cmd += ["--resume", str(resume.relative_to(ROOT))]
     else:
         species = body.get("species", "hawk")
         if species not in SPECIES:
             raise ValueError(f"unknown species {species}")
+        title += f" ({species})"
         cmd += ["--species", species]
         physics = body.get("physics", "wings-v2")
         if body.get("massless_wings"):
@@ -275,8 +273,14 @@ def start_training(body):
                 cmd += ["--soaring"]
     if body.get("no_compile"):
         cmd += ["--no-compile"]
-    job = Job("train", f"Training runs/{name}" + ("" if body.get("resume") else f" ({body.get('species', 'hawk')})"), cmd, log_file=out / "train.log", meta=dict(run=f"runs/{name}"))
     with LOCK:
+        if any(j.kind == "train" and j.proc.poll() is None for j in JOBS):
+            raise ValueError("a training process is still active; wait for it to stop before starting another")
+        if any(out.glob("*.pt")) and (resume is None or resume.parent != out.resolve()):
+            raise ValueError(f"runs/{name} already has checkpoints; pick another name, "
+                             f"or use Continue training on one of its checkpoints")
+        out.mkdir(parents=True, exist_ok=True)
+        job = Job("train", title, cmd, log_file=out / "train.log", meta=dict(run=f"runs/{name}"))
         JOBS.append(job)
     if body.get("live", True):
         LIVE.start(out)
@@ -407,8 +411,8 @@ def start_replay(body):
     out = REPLAY_DIR / f"{stem}_b{birds}_s{seed}.html"
     cmd = [PY, "replay.py", "--ckpt", str(rel), "--birds", str(birds), "--seconds", str(seconds),
            "--seed", str(seed), "--out", str(out.relative_to(ROOT))]
-    job = Job("replay", f"Replay of {rel}", cmd, meta=dict(out=out.name))
     with LOCK:
+        job = Job("replay", f"Replay of {rel}", cmd, meta=dict(out=out.name))
         JOBS.append(job)
     return job
 

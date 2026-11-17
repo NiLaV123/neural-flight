@@ -8,8 +8,9 @@ the GPU (Apple MPS, CUDA, or CPU fallback).
 import argparse
 import json
 import math
-import os
+import tempfile
 import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -87,13 +88,32 @@ def env_config(ck):
                 energy_budget=ck.get("energy_budget", False), soaring=ck.get("soaring", False))
 
 
+def save_checkpoint(ck, path):
+    """Publish a complete file so live view and replay can read it during training."""
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as f:
+        temp_path = Path(f.name)
+    try:
+        torch.save(ck, temp_path)
+        # On Windows an open checkpoint can briefly block replacement.
+        for attempt in range(10):
+            try:
+                temp_path.replace(path)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.05)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--envs", type=int, default=8192)
     p.add_argument("--steps", type=int, default=32, help="rollout length per iteration")
     p.add_argument("--iters", type=int, default=3000)
     p.add_argument("--device", default="auto")
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, help="starting learning rate (default: 0.0003 or the checkpoint's rate)")
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--mb-size", type=int, default=16384)
     p.add_argument("--gamma", type=float, default=0.99)
@@ -115,6 +135,17 @@ def main():
     p.add_argument("--energy-cost", type=float, default=0.0,
                    help="reward penalty per joule of muscle work per kg of bird (wing momentum only), e.g. 0.02")
     args = p.parse_args()
+    for name in ("envs", "steps", "iters", "epochs", "mb_size"):
+        if getattr(args, name) < 1:
+            p.error(f"--{name.replace('_', '-')} must be at least 1")
+    if args.lr is not None and (not math.isfinite(args.lr) or args.lr <= 0):
+        p.error("--lr must be positive and finite")
+    try:
+        snaps = {int(x) for x in args.snapshots.split(",") if x.strip()}
+    except ValueError:
+        p.error("--snapshots must be comma-separated iteration numbers")
+    if any(it < 0 for it in snaps):
+        p.error("--snapshots requires nonnegative iteration numbers")
 
     dev = pick_device(args.device)
     print("device:", dev)
@@ -130,20 +161,23 @@ def main():
     print(f"species: {env.species} | physics: {env.physics} | energy budget: {'on' if env.energy_budget else 'off'} | "
           f"soaring: {'on' if env.soaring else 'off'} | mass {env.MASS} kg | span {2 * env.HALF_SPAN:.2f} m", flush=True)
     ac = ActorCritic(env.N_OBS, BirdEnv.N_ACT).to(dev)
-    opt = torch.optim.Adam(ac.parameters(), lr=args.lr)
+    opt = torch.optim.Adam(ac.parameters(), lr=args.lr if args.lr is not None else 3e-4)
     start_it = 0
     if ck is not None:
         ac.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        if args.lr is not None:
+            for group in opt.param_groups:
+                group["lr"] = args.lr
         env.ring_radius = ck.get("ring_radius", env.ring_radius)
-        start_it = ck.get("iter", 0)
-    os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, "config.json"), "w", encoding="utf-8") as fh:
+        start_it = ck.get("iter", -1) + 1
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / "config.json").open("w", encoding="utf-8") as fh:
         json.dump(dict(cfg, wing_dynamics=cfg["physics"] != "massless", envs=args.envs), fh, indent=2)
 
     def checkpoint(it):
         return dict(model=ac.state_dict(), opt=opt.state_dict(), iter=it, ring_radius=env.ring_radius, **cfg)
 
-    snaps = {int(x) for x in args.snapshots.split(",") if x.strip()}
     T, N = args.steps, args.envs
     buf = {k: torch.zeros(T, N, *s, device=dev) for k, s in
            dict(obs=(env.N_OBS,), act=(BirdEnv.N_ACT,), logp=(), val=(), rew=(), done=()).items()}
@@ -153,24 +187,24 @@ def main():
     ep_len = torch.zeros(N, device=dev)
     stats = dict(ret=[], len=[], rings=[])
     power_sum, power_n, energy_sum = 0.0, 0, 0.0
-    lr = args.lr
+    lr = opt.param_groups[0]["lr"]
     best_rings = -1.0
 
-    for it in range(start_it, start_it + args.iters):
+    last_it = start_it + args.iters - 1
+    for it in range(start_it, last_it + 1):
         t0 = time.time()
         # ------------------------------------------------ rollout (all on GPU)
         with torch.no_grad():
             for t in range(T):
-                ac.norm.update(obs)
                 d, v = ac.dist(obs)
                 a = d.sample()
-                rew, term, trunc, info = env.step(a)
+                rew, _, trunc, info = env.step(a)
                 done = info["done"]
+                ep_ret += rew; ep_len += 1
                 if trunc.any():  # bootstrap value of time-limit truncation
                     rew = rew + args.gamma * trunc.float() * ac.value(env.obs())
                 buf["obs"][t] = obs; buf["act"][t] = a; buf["logp"][t] = d.log_prob(a).sum(-1)
                 buf["val"][t] = v; buf["rew"][t] = rew; buf["done"][t] = done.float()
-                ep_ret += rew; ep_len += 1
                 power_sum += info["power"].sum(); power_n += N; energy_sum += info["energy"].sum()
                 if done.any():
                     idx = done.nonzero().squeeze(-1)
@@ -197,15 +231,15 @@ def main():
         b_obs = buf["obs"].reshape(T * N, -1); b_act = buf["act"].reshape(T * N, -1)
         b_logp = buf["logp"].reshape(-1); b_adv = adv.reshape(-1); b_ret = ret.reshape(-1)
         b_val = buf["val"].reshape(-1)
-        mb = args.mb_size; n_mb = T * N // mb
+        if b_adv.numel() > 1:
+            b_adv = (b_adv - b_adv.mean()) / (b_adv.std(unbiased=False) + 1e-8)
         for _ in range(args.epochs):
             perm = torch.randperm(T * N, device=dev)
-            for k in range(n_mb):
-                i = perm[k * mb:(k + 1) * mb]
+            for i in perm.split(args.mb_size):
                 d, v = ac.dist(b_obs[i])
                 logp = d.log_prob(b_act[i]).sum(-1)
                 ratio = (logp - b_logp[i]).exp()
-                A = b_adv[i]; A = (A - A.mean()) / (A.std() + 1e-8)
+                A = b_adv[i]
                 pl = -torch.min(ratio * A, ratio.clamp(1 - args.clip, 1 + args.clip) * A).mean()
                 v_clip = b_val[i] + (v - b_val[i]).clamp(-args.clip, args.clip)
                 vl = torch.max((v - b_ret[i]) ** 2, (v_clip - b_ret[i]) ** 2).mean()
@@ -222,11 +256,15 @@ def main():
                 for g in opt.param_groups: g["lr"] = lr
             with torch.no_grad():
                 ac.log_std.clamp_(-3.0, 0.0)
+        # Keep the same normalizer for rollout log probabilities and all PPO epochs.
+        ac.norm.update(b_obs)
 
         # ------------------------------------------------ logging / curriculum
         if dev.type == "mps": torch.mps.synchronize()
         dt = time.time() - t0
-        if it % 10 == 0 and stats["ret"]:
+        save_latest = it % 10 == 0 or it == last_it
+        is_best = False
+        if save_latest and stats["ret"]:
             n = len(stats["ret"])
             mr = sum(stats["rings"]) / n
             print(f"it {it:5d} | sps {T*N/dt:8.0f} | ep_ret {sum(stats['ret'])/n:7.2f} | "
@@ -236,15 +274,19 @@ def main():
                   flush=True)
             if mr > 4 and env.ring_radius > env.RING_MIN_R:
                 env.ring_radius = max(env.RING_MIN_R, env.ring_radius * 0.95)
-            ck = checkpoint(it)
-            torch.save(ck, os.path.join(args.out, "latest.pt"))
-            if mr > best_rings and n > 50:
+            is_best = mr > best_rings and n > 50
+            if is_best:
                 best_rings = mr
-                torch.save(ck, os.path.join(args.out, "best.pt"))
             stats = dict(ret=[], len=[], rings=[])
             power_sum, power_n, energy_sum = 0.0, 0, 0.0
+        if save_latest or it in snaps:
+            ck = checkpoint(it)
+            if save_latest:
+                save_checkpoint(ck, out / "latest.pt")
+            if is_best:
+                save_checkpoint(ck, out / "best.pt")
         if it in snaps:
-            torch.save(checkpoint(it), os.path.join(args.out, f"iter_{it}.pt"))
+            save_checkpoint(ck, out / f"iter_{it}.pt")
             print(f"saved snapshot iter_{it}.pt", flush=True)
 
 
