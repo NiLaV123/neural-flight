@@ -232,9 +232,11 @@ class BirdEnv:
             ring_radius = 2 * self.RING_MIN_R
         self.n = num_envs
         self.dev = device
-        self.ring_radius = ring_radius
+        self.static_masks = torch.device(device).type == "cuda"
+        self._ring_radius = ring_radius
         f = dict(device=device, dtype=torch.float32)
         self.f = f
+        self._ring_radius_tensor = torch.tensor(ring_radius, **f)
         self.I = torch.tensor(self.INERTIA, **f)
         lo = [self.FLAP[0], self.SWEEP[0], self.TWIST[0]] * 2 + [self.TAIL_PITCH[0], self.TAIL_TILT[0], self.TAIL_SPREAD[0]]
         hi = [self.FLAP[1], self.SWEEP[1], self.TWIST[1]] * 2 + [self.TAIL_PITCH[1], self.TAIL_TILT[1], self.TAIL_SPREAD[1]]
@@ -293,8 +295,22 @@ class BirdEnv:
         self.since_ring = torch.zeros_like(self.steps)
         self.rings = torch.zeros_like(self.steps)
         impl = self._substep_v2 if self.v2 else (self._substep_dyn if self.wing_dynamics else self._substep_impl)
-        self._substep = self._compiled(impl) if compile else impl
+        self._substep = self._compiled(impl, "_substep", "Physics") if compile else impl
+        self._reset = self._reset_impl
         self.reset(torch.ones(num_envs, dtype=torch.bool, device=device))
+        if compile and self.static_masks:
+            self._reset = self._compiled(self._reset_impl, "_reset", "Reset")
+            self._transition = self._compiled(self._transition, "_transition", "Environment transition")
+            self._observe = self._compiled(self._observe, "_observe", "Observations")
+
+    @property
+    def ring_radius(self):
+        return self._ring_radius
+
+    @ring_radius.setter
+    def ring_radius(self, radius):
+        self._ring_radius = radius
+        self._ring_radius_tensor.fill_(radius)
 
     def _init_v2(self):
         """Constants for the wings-v2 model."""
@@ -330,18 +346,23 @@ class BirdEnv:
                            self.TWIST_STRENGTH * self.FLAP_STRENGTH * mgc)
         self.side_sign = torch.tensor([1.0, -1.0], **f).view(1, 2, 1)
 
-    def _compiled(self, impl):
-        """torch.compile the physics, falling back to plain PyTorch where the compiler
-        isn't available (e.g. Windows without Triton). The fallback is slower but identical."""
-        fast = torch.compile(impl, dynamic=False)
+    def _compiled(self, impl, attribute, label):
+        """Compile a simulator operation with an eager fallback."""
+        fast = None
 
         def run(*args):
+            nonlocal fast
             try:
+                if fast is None:
+                    fast = torch.compile(impl, dynamic=False)
+                    result = fast(*args)
+                    print(f"{label} backend: torch.compile", flush=True)
+                    return result
                 return fast(*args)
             except Exception as e:  # noqa: BLE001
                 msg = str(e).strip().splitlines()[0][:160] if str(e).strip() else type(e).__name__
-                print(f"torch.compile is not available here ({msg}); continuing without it (slower).", flush=True)
-                self._substep = impl
+                print(f"{label} backend: eager (torch.compile failed: {msg})", flush=True)
+                setattr(self, attribute, impl)
                 return impl(*args)
         return run
 
@@ -411,61 +432,71 @@ class BirdEnv:
         return F.sum(1), torque
 
     # ------------------------------------------------------------------ rings
+    def _active_rows(self, mask):
+        # Dynamic index shapes make CUDA wait for the host. Keep a fixed batch there.
+        return slice(None) if self.static_masks else mask.nonzero(as_tuple=True)[0]
+
+    def _write_rows(self, target, mask, rows, value):
+        if self.static_masks:
+            shape = (self.n,) + (1,) * (target.ndim - 1)
+            target.copy_(torch.where(mask.view(shape), value, target))
+        else:
+            target[rows] = value
+
     def spawn_ring(self, mask, from_pos, heading):
-        k = int(mask.sum())
+        rows = self._active_rows(mask)
+        origin = from_pos[rows]
+        k = origin.shape[0]
         if k == 0:
             return
-        yaw = heading[mask] + (torch.rand(k, **self.f) * 2 - 1) * math.radians(70)
+        yaw = heading[rows] + (torch.rand(k, **self.f) * 2 - 1) * math.radians(70)
         dist = (18 + torch.rand(k, **self.f) * 17) * max(1.0, sum(self.START_SPEED) / 20)
         dz = (torch.rand(k, **self.f) * 2 - 1) * 7
-        p = from_pos[mask].clone()
-        p[:, 0] += dist * torch.cos(yaw)
-        p[:, 1] += dist * torch.sin(yaw)
-        p[:, 2] = (p[:, 2] + dz).clamp(15, 70)
-        d = p - from_pos[mask]
+        p = origin + torch.stack([dist * torch.cos(yaw), dist * torch.sin(yaw), dz], -1)
+        p[:, 2] = p[:, 2].clamp(15, 70)
+        d = p - origin
         d[:, 2] *= 0.5
-        self.ring_pos[mask] = p
-        self.ring_n[mask] = d / d.norm(dim=-1, keepdim=True)
+        self._write_rows(self.ring_pos, mask, rows, p)
+        self._write_rows(self.ring_n, mask, rows, d / d.norm(dim=-1, keepdim=True))
 
     # ------------------------------------------------------------------ reset
     def reset(self, mask):
-        k = int(mask.sum())
+        self._reset(mask)
+
+    def _reset_impl(self, mask):
+        rows = self._active_rows(mask)
+        k = self.pos[rows].shape[0]
         if k == 0:
             return
         f = self.f
         yaw = torch.rand(k, **f) * 2 * math.pi
-        self.pos[mask] = torch.stack([torch.zeros(k, **f), torch.zeros(k, **f), 35 + torch.rand(k, **f) * 10], -1)
+        pos = torch.stack([torch.zeros(k, **f), torch.zeros(k, **f), 35 + torch.rand(k, **f) * 10], -1)
+        self._write_rows(self.pos, mask, rows, pos)
         pitch = (torch.rand(k, **f) * 2 - 1) * 0.15
         roll = (torch.rand(k, **f) * 2 - 1) * 0.2
         qy = torch.stack([torch.cos(yaw / 2), 0 * yaw, 0 * yaw, torch.sin(yaw / 2)], -1)
         qp = torch.stack([torch.cos(pitch / 2), 0 * yaw, torch.sin(pitch / 2), 0 * yaw], -1)
         qr = torch.stack([torch.cos(roll / 2), torch.sin(roll / 2), 0 * yaw, 0 * yaw], -1)
         q = quat_mul(quat_mul(qy, qp), qr)
-        self.quat[mask] = q
+        self._write_rows(self.quat, mask, rows, q)
         lo, hi = self.START_SPEED
         speed = lo + torch.rand(k, **f) * (hi - lo)
         fwd = quat_to_mat(q)[:, :, 0]
-        self.vel[mask] = fwd * speed.unsqueeze(-1)
-        self.omega[mask] = 0
+        self._write_rows(self.vel, mask, rows, fwd * speed.unsqueeze(-1))
         j = torch.zeros(k, 9, **f)
         j[:, 8] = 0.5
-        self.joints[mask] = j
-        self.target[mask] = j
-        self.qd[mask] = 0
-        self.rdot[mask] = 0
-        self.acc[mask] = 0
-        self.dom[mask] = 0
-        self.energy[mask] = self.e_max
+        self._write_rows(self.joints, mask, rows, j)
+        self._write_rows(self.target, mask, rows, j)
+        for state in (self.omega, self.qd, self.rdot, self.acc, self.dom, self.steps, self.since_ring, self.rings):
+            state.masked_fill_(mask.view((self.n,) + (1,) * (state.ndim - 1)), 0)
+        self.energy.masked_fill_(mask, self.e_max)
         if self.soaring:
-            self.wind_ref[mask] = torch.rand(k, **f) * self.WIND_MAX
+            self._write_rows(self.wind_ref, mask, rows, torch.rand(k, **f) * self.WIND_MAX)
             wa = torch.rand(k, **f) * 2 * math.pi
-            self.wind_dir[mask] = torch.stack([torch.cos(wa), torch.sin(wa)], -1)
-            self.therm[mask] = self._new_thermals(self.pos[mask], self.N_THERMALS, near=0.0)
-        self.steps[mask] = 0
-        self.since_ring[mask] = 0
-        self.rings[mask] = 0
+            self._write_rows(self.wind_dir, mask, rows, torch.stack([torch.cos(wa), torch.sin(wa)], -1))
+            self._write_rows(self.therm, mask, rows, self._new_thermals(pos, self.N_THERMALS, near=0.0))
         self.spawn_ring(mask, self.pos, torch.atan2(self.vel[:, 1], self.vel[:, 0]))
-        self.prev_dist[mask] = (self.ring_pos[mask] - self.pos[mask]).norm(dim=-1)
+        self._write_rows(self.prev_dist, mask, rows, (self.ring_pos[rows] - pos).norm(dim=-1))
 
     # ------------------------------------------------------------------ soaring
     def _new_thermals(self, center, k_th, near=30.0):
@@ -481,7 +512,7 @@ class BirdEnv:
         """Thermals far behind the bird dissipate and new ones form around it."""
         d = (self.therm[..., :2] - self.pos[:, None, :2]).norm(dim=-1)
         far = d > 130.0
-        if far.any():
+        if self.static_masks or far.any():
             fresh = self._new_thermals(self.pos, self.N_THERMALS, near=40.0)
             self.therm = torch.where(far.unsqueeze(-1), fresh, self.therm)
 
@@ -498,6 +529,9 @@ class BirdEnv:
 
     # ------------------------------------------------------------------ obs
     def obs(self):
+        return self._observe()
+
+    def _observe(self):
         R = quat_to_mat(self.quat)
         Rt = R.transpose(-1, -2)
         v_b = mv(Rt, self.vel)
@@ -751,6 +785,9 @@ class BirdEnv:
                 (self.pos, self.vel, self.quat, self.omega, self.joints, r_prev) = self._substep(
                     self.pos, self.vel, self.quat, self.omega, self.joints, self.target, r_prev)
 
+        return self._transition(start_pos, action)
+
+    def _transition(self, start_pos, action):
         self.steps += 1
         self.since_ring += 1
 
@@ -760,7 +797,7 @@ class BirdEnv:
         crossed = (d0 < 0) & (d1 >= 0)
         t = d0 / (d0 - d1 + 1e-8)
         hit_pt = start_pos + (self.pos - start_pos) * t.unsqueeze(-1)
-        passed = crossed & ((hit_pt - self.ring_pos).norm(dim=-1) < self.ring_radius)
+        passed = crossed & ((hit_pt - self.ring_pos).norm(dim=-1) < self._ring_radius_tensor)
 
         dist = (self.ring_pos - self.pos).norm(dim=-1)
         reward = (self.prev_dist - dist).clamp(-1, 1)           # progress toward ring (m)
@@ -774,7 +811,7 @@ class BirdEnv:
         reward = reward - 5.0 * crash.float()
 
         self.rings += passed.long()
-        self.since_ring[passed] = 0
+        self.since_ring.masked_fill_(passed, 0)
         if self.energy_budget:
             self.energy = (self.energy - self.work - self.BASAL_W_PER_KG * self.MASS * self.DT
                            + passed.float() * self.RING_FOOD * self.e_max).clamp(0, self.e_max)

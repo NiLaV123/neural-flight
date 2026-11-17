@@ -12,9 +12,12 @@ import re
 import shutil
 import subprocess
 import sys
+from importlib.metadata import PackageNotFoundError, version
 
 # PyTorch CUDA builds, newest first: (tag, lowest driver CUDA version it needs)
 CUDA_BUILDS = [("cu132", (13, 2)), ("cu130", (13, 0)), ("cu128", (12, 8)), ("cu126", (12, 6))]
+# Windows Triton minor versions supported by each PyTorch release.
+TRITON_MINOR = {4: 1, 5: 1, 6: 2, 7: 3, 8: 4, 9: 5, 10: 6, 11: 6, 12: 7, 13: 7, 14: 8, 15: 9}
 
 
 def nvidia():
@@ -66,13 +69,23 @@ def gpu_works():
 
 
 def ensure_triton():
-    """torch.compile needs Triton, which Windows PyTorch doesn't ship; the triton-windows package
-    provides it and roughly halves the time of a physics step. Optional: training runs without it."""
-    r = subprocess.run([sys.executable, "-c", "import triton"], capture_output=True)
-    if r.returncode == 0:
+    """Use the Windows Triton release series matched to the installed PyTorch."""
+    try:
+        torch_version = version("torch")
+    except PackageNotFoundError:
         return
-    print("Installing triton-windows so torch.compile can speed up the physics...")
-    if subprocess.call([sys.executable, "-m", "pip", "install", "triton-windows"]) != 0:
+    match = re.match(r"2\.(\d+)\.", torch_version)
+    minor = TRITON_MINOR.get(int(match[1])) if match else None
+    if minor is None:
+        print(f"No automatic Triton version selection for PyTorch {torch_version}.")
+        return
+    r = subprocess.run([sys.executable, "-c", "import triton; print(triton.__version__)"],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip().split(".")[:2] == ["3", str(minor)]:
+        return
+    print(f"Installing Triton 3.{minor} for PyTorch {torch_version}...")
+    package = f"triton-windows>=3.{minor},<3.{minor + 1}"
+    if subprocess.call([sys.executable, "-m", "pip", "install", package]) != 0:
         print("Could not install triton-windows; training will run without torch.compile (slower).")
 
 

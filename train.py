@@ -71,7 +71,10 @@ class ActorCritic(nn.Module):
     def dist(self, obs):
         x = self.norm(obs)
         mu = self.actor(x)
-        return torch.distributions.Normal(mu, self.log_std.exp().expand_as(mu)), self.critic(x).squeeze(-1)
+        # CUDA distribution checks read scalar results on the host. Check the PPO objective instead.
+        dist = torch.distributions.Normal(mu, self.log_std.exp().expand_as(mu),
+                                          validate_args=False if obs.is_cuda else None)
+        return dist, self.critic(x).squeeze(-1)
 
     def value(self, obs):
         return self.critic(self.norm(obs)).squeeze(-1)
@@ -185,8 +188,16 @@ def main():
     obs = env.obs()
     ep_ret = torch.zeros(N, device=dev)
     ep_len = torch.zeros(N, device=dev)
-    stats = dict(ret=[], len=[], rings=[])
-    power_sum, power_n, energy_sum = 0.0, 0, 0.0
+    completed = torch.empty(T, N, 3, device=dev)
+    episode_count = torch.zeros((), device=dev)
+    episode_totals = torch.zeros(3, device=dev)
+    max_rings = torch.zeros((), device=dev)
+    effort = torch.empty(T, 2, device=dev)
+    effort_totals = torch.zeros(2, device=dev)
+    effort_count = 0
+    cuda = dev.type == "cuda"
+    terminal_obs = torch.empty_like(buf["obs"]) if cuda else None
+    truncated = torch.empty(T, N, dtype=torch.bool, device=dev) if cuda else None
     lr = opt.param_groups[0]["lr"]
     best_rings = -1.0
 
@@ -201,20 +212,29 @@ def main():
                 rew, _, trunc, info = env.step(a)
                 done = info["done"]
                 ep_ret += rew; ep_len += 1
-                if trunc.any():  # bootstrap value of time-limit truncation
-                    rew = rew + args.gamma * trunc.float() * ac.value(env.obs())
+                if cuda:
+                    terminal_obs[t] = env.obs()
+                    truncated[t] = trunc
+                elif trunc.any():
+                    rew = rew + args.gamma * torch.where(trunc, ac.value(env.obs()), 0.0)
                 buf["obs"][t] = obs; buf["act"][t] = a; buf["logp"][t] = d.log_prob(a).sum(-1)
                 buf["val"][t] = v; buf["rew"][t] = rew; buf["done"][t] = done.float()
-                power_sum += info["power"].sum(); power_n += N; energy_sum += info["energy"].sum()
-                if done.any():
-                    idx = done.nonzero().squeeze(-1)
-                    stats["ret"] += ep_ret[idx].tolist()
-                    stats["len"] += ep_len[idx].tolist()
-                    stats["rings"] += info["rings"][idx].float().tolist()
-                    ep_ret[idx] = 0; ep_len[idx] = 0
-                    env.reset(done)
+                completed[t] = torch.stack((ep_ret, ep_len, info["rings"]), dim=-1)
+                effort[t] = torch.stack((info["power"].sum(), info["energy"].sum()))
+                ep_ret.masked_fill_(done, 0)
+                ep_len.masked_fill_(done, 0)
+                env.reset(done)
                 obs = env.obs()
             last_val = ac.value(obs)
+            # Batch time-limit bootstrapping before GAE to sync once per CUDA rollout.
+            if cuda and truncated.any():
+                buf["rew"][truncated] += args.gamma * ac.value(terminal_obs[truncated])
+            completed.masked_fill_(~buf["done"].bool().unsqueeze(-1), 0)
+            episode_totals += completed.sum(dim=(0, 1))
+            episode_count += buf["done"].sum()
+            max_rings = torch.maximum(max_rings, completed[..., 2].amax())
+            effort_totals += effort.sum(dim=0)
+            effort_count += T * N
 
             # GAE
             adv = torch.zeros_like(buf["rew"])
@@ -250,7 +270,10 @@ def main():
                 nn.utils.clip_grad_norm_(ac.parameters(), 1.0)
                 opt.step()
                 with torch.no_grad():  # adaptive LR on KL
-                    kl = ((ratio - 1) - (logp - b_logp[i])).mean().item()
+                    divergence = ((ratio - 1) - (logp - b_logp[i])).mean()
+                    kl, objective = torch.stack((divergence, loss)).tolist()
+                if not (math.isfinite(kl) and math.isfinite(objective)):
+                    raise FloatingPointError(f"Non-finite PPO update at iteration {it}")
                 if kl > 0.02: lr = max(lr / 1.5, 1e-5)
                 elif kl < 0.005: lr = min(lr * 1.5, 1e-3)
                 for g in opt.param_groups: g["lr"] = lr
@@ -260,25 +283,31 @@ def main():
         ac.norm.update(b_obs)
 
         # ------------------------------------------------ logging / curriculum
-        if dev.type == "mps": torch.mps.synchronize()
-        dt = time.time() - t0
         save_latest = it % 10 == 0 or it == last_it
         is_best = False
-        if save_latest and stats["ret"]:
-            n = len(stats["ret"])
-            mr = sum(stats["rings"]) / n
-            print(f"it {it:5d} | sps {T*N/dt:8.0f} | ep_ret {sum(stats['ret'])/n:7.2f} | "
-                  f"ep_len {sum(stats['len'])/n:6.0f} | rings/ep {mr:5.2f} | max {max(stats['rings']):3.0f} | "
-                  f"ring_r {env.ring_radius:.2f} | std {ac.log_std.exp().mean():.3f} | lr {lr:.1e} | "
-                  f"power {float(power_sum) / max(power_n, 1):7.2f} W | energy {float(energy_sum) / max(power_n, 1):.2f}",
-                  flush=True)
-            if mr > 4 and env.ring_radius > env.RING_MIN_R:
-                env.ring_radius = max(env.RING_MIN_R, env.ring_radius * 0.95)
-            is_best = mr > best_rings and n > 50
-            if is_best:
-                best_rings = mr
-            stats = dict(ret=[], len=[], rings=[])
-            power_sum, power_n, energy_sum = 0.0, 0, 0.0
+        if save_latest:
+            n, max_ep_rings, std, total_ret, total_len, total_rings, power, energy = torch.cat((
+                torch.stack((episode_count, max_rings, ac.log_std.detach().exp().mean())),
+                episode_totals, effort_totals,
+            )).tolist()
+            dt = time.time() - t0
+            if n:
+                mr = total_rings / n
+                print(f"it {it:5d} | sps {T*N/dt:8.0f} | ep_ret {total_ret/n:7.2f} | "
+                      f"ep_len {total_len/n:6.0f} | rings/ep {mr:5.2f} | max {max_ep_rings:3.0f} | "
+                      f"ring_r {env.ring_radius:.2f} | std {std:.3f} | lr {lr:.1e} | "
+                      f"power {power/effort_count:7.2f} W | energy {energy/effort_count:.2f}",
+                      flush=True)
+                if mr > 4 and env.ring_radius > env.RING_MIN_R:
+                    env.ring_radius = max(env.RING_MIN_R, env.ring_radius * 0.95)
+                is_best = mr > best_rings and n > 50
+                if is_best:
+                    best_rings = mr
+                episode_count.zero_()
+                episode_totals.zero_()
+                max_rings.zero_()
+                effort_totals.zero_()
+                effort_count = 0
         if save_latest or it in snaps:
             ck = checkpoint(it)
             if save_latest:

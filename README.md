@@ -32,7 +32,7 @@ The hub uses only the Python standard library and runs the same `train.py` and `
 Training runs on NVIDIA GPUs through CUDA, on Windows and Linux.
 
 - **Windows:** `start.bat` needs Python 3 from python.org with "Add python.exe to PATH" ticked. Every time it starts, `setup_env.py` checks that PyTorch can actually run on your NVIDIA GPU. If it can't, for example because a CPU-only build was installed or the build is too old for the card, it reinstalls the right CUDA build automatically, picked from your driver's CUDA version. RTX 50-series cards need a driver that supports CUDA 12.8 or newer, and the script tells you if yours is too old. The hub's top bar should show **CUDA**. It warns you if an NVIDIA GPU is present but unused.
-- **`torch.compile`:** on Windows it often isn't available because it needs Triton. When that happens, training says so once and carries on without it. The results are the same, but training is slower.
+- **`torch.compile`:** the Windows launcher selects the Triton version that matches PyTorch. Training reports which parts compiled successfully and falls back to eager PyTorch if a compiler is unavailable. The first iteration includes compiler warm-up. Use `--no-compile` for short smoke tests and compare later iterations when measuring throughput.
 - **Linux:** the default `pip install torch` already includes CUDA, so `./start.sh` works as is.
 
 ## Bird species
